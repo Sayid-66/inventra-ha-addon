@@ -52,7 +52,7 @@ DEVICE_PREFIX = "01a0dd7c-fc9b-7dd5-951c-3a8695801443"
 DEVICE_NAME = "TestPhone-PostFix"
 LOCATION_IDS = (
     "01a07313-9cc6-7337-8feb-ca869b408ce3",
-    "01a07cc7-3f1d-77b6-8da8-bb912747d501",
+    "01a07107-8803-7073-9ced-53e159c1ed73",
 )
 CLEAR_MODELS = (
     m.Product, m.Barcode, m.Batch, m.PurchaseEvent, m.ConsumptionEvent,

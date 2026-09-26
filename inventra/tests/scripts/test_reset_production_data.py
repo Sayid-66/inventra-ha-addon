@@ -17,7 +17,7 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts/reset_production_data.py
 KEEP_DEVICE = "01a0dd7c-fc9b-7dd5-951c-3a8695801443"
 REMOVE_LOCATIONS = (
     "01a07313-9cc6-7337-8feb-ca869b408ce3",
-    "01a07cc7-3f1d-77b6-8da8-bb912747d501",
+    "01a07107-8803-7073-9ced-53e159c1ed73",
 )
 COUNTS = {
     "products": 20, "barcodes": 9, "batches": 16, "purchase_events": 26,
