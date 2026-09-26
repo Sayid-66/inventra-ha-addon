@@ -137,28 +137,42 @@ def commit_purchase(
         if product is None:
             resolution_id = new_product.get("resolutionId")
             resolution = get_resolution(db, resolution_id) if resolution_id else None
-            submitted = {"name": new_product["name"], "imageUrl": new_product.get("imageUrl")}
+            submitted = {
+                "name": new_product["name"], "imageUrl": new_product.get("imageUrl"),
+                "brand": new_product.get("brand"), "variant": new_product.get("variant"),
+                "category": new_product.get("category"),
+            }
             provenance = derive_field_provenance(resolution, submitted, {})
             product = Product(
                 id=product_id, name=new_product["name"], image_url=new_product.get("imageUrl"),
+                brand=new_product.get("brand"), variant=new_product.get("variant"),
+                category=new_product.get("category"),
                 field_provenance=_json.dumps(provenance) if provenance else None, version=1,
             )
             db.add(product)
             db.flush()
-            cs.record("Product", product_id, ChangeKind.CREATE, {
-                "id": product.id, "name": product.name, "imageUrl": product.image_url,
-                "minStock": product.min_stock, "contentUnitLabel": product.content_unit_label,
-                "version": product.version, "deletedAt": None,
-            })
+            from .product_service import _to_dict
+            cs.record("Product", product_id, ChangeKind.CREATE, _to_dict(product))
 
-        from .barcode_service import find_barcode
         from ..db.models import Barcode
-        if find_barcode(db, barcode) is None and db.get(Barcode, barcode) is None:
+        barcode_row = db.get(Barcode, barcode)
+        if barcode_row is None:
             new_barcode = Barcode(code=barcode, product_id=product.id, version=1)
             db.add(new_barcode)
             db.flush()
             cs.record("Barcode", barcode, ChangeKind.CREATE, {
                 "code": barcode, "productId": product.id, "version": 1, "deletedAt": None,
+            })
+        elif new_product is not None and (barcode_row.deleted_at is not None or barcode_row.product_id != product.id):
+            if barcode_row.deleted_at is None:
+                raise BusinessRuleViolation("BARCODE_ALREADY_ASSIGNED", f"barcode {barcode} belongs to another product")
+            barcode_row.product_id = product.id
+            barcode_row.deleted_at = None
+            barcode_row.version += 1
+            db.flush()
+            cs.record("Barcode", barcode, ChangeKind.UPDATE, {
+                "code": barcode, "productId": product.id,
+                "version": barcode_row.version, "deletedAt": None,
             })
 
         is_content_tracked = content_unit_label is not None
@@ -172,11 +186,8 @@ def commit_purchase(
         if product_changed:
             product.version += 1
             db.flush()
-            cs.record("Product", product.id, ChangeKind.UPDATE, {
-                "id": product.id, "name": product.name, "imageUrl": product.image_url,
-                "minStock": product.min_stock, "contentUnitLabel": product.content_unit_label,
-                "version": product.version, "deletedAt": None,
-            })
+            from .product_service import _to_dict
+            cs.record("Product", product.id, ChangeKind.UPDATE, _to_dict(product))
 
         event = PurchaseEvent(
             id=event_id, product_id=product.id, timestamp=timestamp, barcode=barcode,

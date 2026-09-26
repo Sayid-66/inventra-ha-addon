@@ -37,32 +37,52 @@ def _find_by_uid(items: list[dict], uid: str) -> Optional[dict]:
     return None
 
 
+def build_display_name(name: str, brand: str | None, variant: str | None) -> str:
+    result = name.strip()
+    variant = variant.strip() if variant else ""
+    brand = brand.strip() if brand else ""
+    if variant and variant.lower() not in result.lower():
+        result = f"{result} {variant}".strip()
+    if brand and brand.lower() not in result.lower():
+        result = f"{brand} {result}".strip()
+    if len(result) <= 60:
+        return result
+    words = result.split()
+    shortened = words[0]
+    for word in words[1:]:
+        if len(shortened) + 1 + len(word) > 60:
+            break
+        shortened += f" {word}"
+    return shortened
+
+
 def _find_name_conflict(db: Session, product_id: str, name: str) -> Optional[str]:
     """§4.5: any OTHER product with an active bring_watch_state row
-    whose owning product's current name matches blocks a new automatic add.
+    whose owning product's current display name matches blocks a new automatic add.
 
-    Compare against Product.name, rather than the watch row's
+    Compare against the current Product fields, rather than the watch row's
     bring_item_name snapshot, so a stale snapshot left by a rename cannot
     block a later product that legitimately reuses the old name.
     """
-    return db.execute(
-        select(BringWatchState.product_id)
+    for other_id, other_name, other_brand, other_variant in db.execute(
+        select(BringWatchState.product_id, Product.name, Product.brand, Product.variant)
         .join(Product, Product.id == BringWatchState.product_id)
-        .where(
-            Product.name == name,
-            BringWatchState.product_id != product_id,
-        )
-    ).scalar_one_or_none()
+        .where(BringWatchState.product_id != product_id)
+    ):
+        if build_display_name(other_name, other_brand, other_variant) == name:
+            return other_id
+    return None
 
 
 async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient) -> BringWatchState:
     """Called only when no bring_watch_state row exists yet for this
     product and its stock is below min_stock (spec §4.2/§4.3/§4.5)."""
-    conflict_product_id = _find_name_conflict(db, product.id, product.name)
+    item_name = build_display_name(product.name, product.brand, product.variant)
+    conflict_product_id = _find_name_conflict(db, product.id, item_name)
     if conflict_product_id is not None:
         watch = BringWatchState(
             product_id=product.id, state=BringWatchStateEnum.ERROR, origin=BringWatchOrigin.INVENTRA_CREATED,
-            bring_item_name=product.name, bring_uid=None, retry_count=0, confirmation_deadline_at=None,
+            bring_item_name=item_name, bring_uid=None, retry_count=0, confirmation_deadline_at=None,
             last_error=f"name_conflict_with_product_id={conflict_product_id}",
             created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
         )
@@ -77,11 +97,11 @@ async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient)
         # reconcile cycle will retry from a clean slate (spec §5).
         return None
 
-    existing = _find_by_name(items, product.name)
+    existing = _find_by_name(items, item_name)
     if existing is not None and existing["status"] == "needs_action":
         watch = BringWatchState(
             product_id=product.id, state=BringWatchStateEnum.ON_LIST_CONFIRMED, origin=BringWatchOrigin.ADOPTED_EXISTING,
-            bring_item_name=product.name, bring_uid=existing["uid"], retry_count=0, confirmation_deadline_at=None,
+            bring_item_name=item_name, bring_uid=existing["uid"], retry_count=0, confirmation_deadline_at=None,
             created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
         )
         db.add(watch)
@@ -92,7 +112,7 @@ async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient)
     # ignored here — only a uid WE later confirm may ever lock (§4.2).
     watch = BringWatchState(
         product_id=product.id, state=BringWatchStateEnum.PENDING_ADD, origin=BringWatchOrigin.INVENTRA_CREATED,
-        bring_item_name=product.name, bring_uid=None, retry_count=0,
+        bring_item_name=item_name, bring_uid=None, retry_count=0,
         confirmation_deadline_at=datetime.utcnow() + CONFIRMATION_TIMEOUT,
         created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
     )
@@ -100,7 +120,7 @@ async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient)
     db.flush()  # persisted BEFORE the external call — crash safety, spec §4.3
 
     try:
-        await client.add_item(product.name)
+        await client.add_item(item_name)
     except HomeAssistantApiError:
         pass  # harmless: next reconcile cycle retries add_item (Bring! merges by name)
     return watch

@@ -1,4 +1,7 @@
 import uuid
+from sqlalchemy import text
+
+from inventra_backend.db.base import get_engine
 
 from tests.ids import test_uuid
 
@@ -40,6 +43,47 @@ def test_purchase_new_product_creates_product_barcode_event_and_batch(api_client
         "/api/v1/barcodes", json={"operationId": test_uuid("opX"), "code": "4001", "productId": product_id}, headers=_headers(device),
     )
     assert barcodes.status_code == 409  # already assigned by the purchase — proves the barcode row exists
+
+
+def test_manual_purchase_persists_fields_and_resolves_barcode_locally(api_client_with_device):
+    client, device = api_client_with_device
+    headers = _headers(device)
+    product_id = test_uuid("manual-product")
+    location_id = test_uuid("manual-location")
+    barcode = "2990000000123"
+    assert client.post(
+        "/api/v1/locations",
+        json={"operationId": test_uuid("manual-location-op"), "id": location_id, "name": "Keller"},
+        headers=headers,
+    ).status_code == 201
+
+    response = client.post(
+        "/api/v1/purchases",
+        json={
+            "operationId": test_uuid("manual-purchase-op"), "id": test_uuid("manual-event"),
+            "productId": product_id,
+            "newProduct": {"name": "Haferdrink", "brand": "Nord", "variant": "Barista", "category": "Getränke"},
+            "barcode": barcode, "locationId": location_id, "quantity": 2,
+            "minStock": 3, "timestamp": 1000,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 201
+
+    with get_engine().connect() as connection:
+        product = connection.execute(text(
+            "SELECT name, brand, variant, category, min_stock FROM products WHERE id = :id"
+        ), {"id": product_id}).one()
+        linked_id = connection.execute(text(
+            "SELECT product_id FROM barcodes WHERE code = :code AND deleted_at IS NULL"
+        ), {"code": barcode}).scalar_one()
+    assert tuple(product) == ("Haferdrink", "Nord", "Barista", "Getränke", 3)
+    assert linked_id == product_id
+
+    resolved = client.post("/api/v1/products/resolve", json={"barcode": barcode}, headers=headers)
+    assert resolved.status_code == 200
+    assert resolved.json()["matchedLocally"] is True
+    assert resolved.json()["product"]["id"] == product_id
 
 
 def test_purchase_replay_same_operation_id_is_safe_noop(api_client_with_device):

@@ -9,6 +9,9 @@ class NewProductInfo(BaseModel):
     name: str
     image_url: Optional[str] = Field(default=None, alias="imageUrl")
     resolution_id: Optional[str] = Field(default=None, alias="resolutionId")
+    brand: Optional[str] = None
+    variant: Optional[str] = None
+    category: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 

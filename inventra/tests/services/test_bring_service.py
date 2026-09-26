@@ -5,7 +5,7 @@ import pytest
 from inventra_backend.db.models import BringWatchOrigin, BringWatchState, BringWatchStateEnum, Product
 from inventra_backend.services.bring_service import (
     CONFIRMATION_MIN_ATTEMPTS, CONFIRMATION_TIMEOUT,
-    advance_on_list_confirmed, advance_pending_add, try_add_or_adopt,
+    advance_on_list_confirmed, advance_pending_add, build_display_name, try_add_or_adopt,
 )
 from inventra_backend.services.bring_ha_client import HomeAssistantApiError
 from inventra_backend.services.bring_service import evaluate_product, on_product_deleted, reconcile_once
@@ -26,6 +26,54 @@ class _FakeClient:
 
     async def remove_item(self, uid):
         self.removed.append(uid)
+
+
+@pytest.mark.parametrize("name,brand,variant,expected", [
+    ("Wasser", None, None, "Wasser"),
+    ("Knuspermüsli", "Vitalis", None, "Vitalis Knuspermüsli"),
+    ("Cola", None, "Cherry", "Cola Cherry"),
+    ("Cola", "Coca-Cola", "Cherry", "Coca-Cola Cola Cherry"),
+    ("Vitalis Knuspermüsli", "vitalis", None, "Vitalis Knuspermüsli"),
+    ("Cola Cherry", None, "cherry", "Cola Cherry"),
+    ("Lange Beschreibung mit mehreren ganzen Wörtern und einem abschließenden Wort", None, None,
+     "Lange Beschreibung mit mehreren ganzen Wörtern und einem"),
+    (f"😀 {'a' * 58} b", None, None, f"😀 {'a' * 58}"),
+])
+def test_build_display_name(name, brand, variant, expected):
+    assert build_display_name(name, brand, variant) == expected
+
+
+@pytest.mark.anyio
+async def test_try_add_or_adopt_uses_display_name_for_snapshot_and_confirmation(db_session):
+    product = Product(id="p1", name="Knuspermüsli", brand="Vitalis", variant="Schoko", version=1, min_stock=3)
+    db_session.add(product)
+    db_session.flush()
+    client = _FakeClient(items=[])
+
+    watch = await try_add_or_adopt(db_session, product, client)
+
+    assert client.added == ["Vitalis Knuspermüsli Schoko"]
+    assert watch.bring_item_name == client.added[0]
+    advance_pending_add(watch, client.items)
+    assert watch.state == BringWatchStateEnum.ON_LIST_CONFIRMED
+
+
+@pytest.mark.anyio
+async def test_same_base_name_with_different_brands_does_not_conflict(db_session):
+    other = Product(id="p2", name="Müsli", brand="Vitalis", version=1, min_stock=3)
+    product = Product(id="p1", name="Müsli", brand="Alnatura", version=1, min_stock=3)
+    db_session.add_all([other, product, BringWatchState(
+        product_id="p2", state=BringWatchStateEnum.ON_LIST_CONFIRMED,
+        origin=BringWatchOrigin.INVENTRA_CREATED, bring_item_name="Vitalis Müsli",
+        bring_uid="u2", retry_count=0, created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+    )])
+    db_session.flush()
+
+    client = _FakeClient(items=[])
+    watch = await try_add_or_adopt(db_session, product, client)
+
+    assert watch.state == BringWatchStateEnum.PENDING_ADD
+    assert client.added == ["Alnatura Müsli"]
 
 
 @pytest.mark.anyio
