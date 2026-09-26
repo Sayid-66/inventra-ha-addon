@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Geräteübersicht – Inventra{% endblock %}
+
+{% block content %}
+  <h1>Geräteübersicht</h1>
+
+  {% if devices %}
+    {% for device in devices %}
+      <article class="card device-card">
+        <h2>{{ device.device_name }}</h2>
+        <dl class="info-list">
+          <dt>Gekoppelt seit:</dt>
+          <dd>{{ device.created_at }}</dd>
+
+          <dt>Status</dt>
+          <dd>
+            {% if device.revoked_at %}
+              Widerrufen am {{ device.revoked_at }}
+            {% else %}
+              Aktiv
+            {% endif %}
+          </dd>
+
+          <dt>Zuletzt aktiv:</dt>
+          <dd>{{ device.last_seen_at or "Noch nie" }}</dd>
+
+          <dt>Standard-Standort:</dt>
+          <dd>
+            <form
+              class="action-form"
+              method="post"
+              action="{{ ingress_url(request, 'geraete/' + device.device_id + '/default-location') }}"
+            >
+              <label for="default-location-{{ device.device_id }}">Standort</label>
+              <select id="default-location-{{ device.device_id }}" name="locationId">
+                <option value=""{% if not device.default_location_id %} selected{% endif %}>Kein Standard-Standort</option>
+                {% for location in locations %}
+                  <option value="{{ location.id }}"{% if location.id == device.default_location_id %} selected{% endif %}>{{ location.name }}</option>
+                {% endfor %}
+              </select>
+              <button class="btn btn-secondary" type="submit">Speichern</button>
+            </form>
+          </dd>
+        </dl>
+        {% if not device.revoked_at %}
+          <form
+            class="action-form"
+            method="post"
+            action="{{ ingress_url(request, 'geraete/' + device.device_id + '/revoke') }}"
+            x-data="{ confirming: false }"
+          >
+            <button class="btn btn-danger" type="button" x-show="!confirming" @click="confirming = true">
+              Gerät widerrufen
+            </button>
+            <span class="confirm-actions" x-show="confirming" x-cloak style="display: none;">
+              Wirklich widerrufen?
+              <button class="btn btn-danger" type="submit">Ja, widerrufen</button>
+              <button class="btn btn-secondary" type="button" @click="confirming = false">Abbrechen</button>
+            </span>
+          </form>
+        {% endif %}
+      </article>
+    {% endfor %}
+  {% else %}
+    <p class="empty-state">Keine Geräte gekoppelt.</p>
+  {% endif %}
+{% endblock %}

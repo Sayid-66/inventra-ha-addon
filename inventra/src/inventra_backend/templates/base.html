@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Inventra{% endblock %}</title>
+  <link rel="stylesheet" href="{{ ingress_url(request, 'static/css/style.css') }}">
+  <script src="{{ ingress_url(request, 'static/vendor/htmx-1.9.12.min.js') }}"></script>
+  <script defer src="{{ ingress_url(request, 'static/vendor/alpine-3.14.1.min.js') }}"></script>
+  <script src="{{ ingress_url(request, 'static/vendor/chart-4.5.1.min.js') }}"></script>
+</head>
+<body>
+  <header class="site-header">
+    <nav class="site-nav" aria-label="Hauptnavigation">
+      <a href="{{ ingress_url(request, '') }}">Dashboard</a>
+      <a href="{{ ingress_url(request, 'bestand') }}">Bestand</a>
+      <a href="{{ ingress_url(request, 'historie') }}">Historie</a>
+      <a href="{{ ingress_url(request, 'geraete') }}">Geräte</a>
+      <a href="{{ ingress_url(request, 'pairing') }}">Pairing</a>
+    </nav>
+  </header>
+  <main class="page-shell">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

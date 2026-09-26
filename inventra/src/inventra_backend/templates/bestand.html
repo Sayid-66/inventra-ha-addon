@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Bestandsübersicht – Inventra{% endblock %}
+
+{% block content %}
+  <h1>Bestandsübersicht</h1>
+
+  {% if products %}
+    {% for product in products %}
+      <article class="card product-card">
+        <h2><a href="{{ ingress_url(request, 'produkt/' + product.productId) }}">{{ product.name }}</a></h2>
+
+        {% if product.imageUrl %}
+          <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
+        {% endif %}
+
+        <dl class="info-list">
+          <dt>Gesamtbestand (STK)</dt>
+          <dd>{{ product.totalStk }}</dd>
+
+          {% if product.totalContent is not none %}
+            <dt>Gesamtinhalt</dt>
+            <dd>{{ product.totalContent }}{% if product.contentUnitLabel %} {{ product.contentUnitLabel }}{% endif %}</dd>
+          {% endif %}
+
+          {% if product.nextMhd %}
+            <dt>Nächstes MHD</dt>
+            <dd>{{ product.nextMhd }}</dd>
+          {% endif %}
+
+          {% if product.minStock is not none %}
+            <dt>Mindestbestand</dt>
+            <dd>{{ product.minStock }}</dd>
+          {% endif %}
+        </dl>
+
+        {% if product.stkByLocation %}
+          <h3>STK nach Lagerort</h3>
+          <ul class="stock-list">
+            {% for stock in product.stkByLocation %}
+              <li>{{ stock.locationName }}: {{ stock.quantity }} STK</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        {% if product.contentByLocation %}
+          <h3>Inhalt nach Lagerort</h3>
+          <ul class="stock-list">
+            {% for stock in product.contentByLocation %}
+              <li>{{ stock.locationName }}: {{ stock.quantity }}{% if product.contentUnitLabel %} {{ product.contentUnitLabel }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </article>
+    {% endfor %}
+  {% else %}
+    <p class="empty-state">Kein Produkt auf Lager.</p>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from ..db.models import (
+    ChangeKind,
+    ChangeLog,
+    ConsumptionEvent,
+    CorrectionEvent,
+    Product,
+    PurchaseEvent,
+    RelocationEvent,
+)
+from ..errors import DuplicateEntityError, StaleVersionError
+from ..idempotency.operations import run_idempotent
+from ..revision.change_log import ChangeSet
+
+
+def _to_dict(product: Product) -> dict:
+    return {
+        "id": product.id,
+        "name": product.name,
+        "imageUrl": product.image_url,
+        "minStock": product.min_stock,
+        "contentUnitLabel": product.content_unit_label,
+        "brand": product.brand,
+        "quantity": product.quantity,
+        "quantityUnit": product.quantity_unit,
+        "category": product.category,
+        "variant": product.variant,
+        "fieldProvenance": json.loads(product.field_provenance) if product.field_provenance else {},
+        "version": product.version,
+        "deletedAt": product.deleted_at.isoformat() if product.deleted_at else None,
+    }
+
+
+def get_product(db: Session, id: str) -> Product | None:
+    return db.get(Product, id)
+
+
+def create_product(
+    db: Session, cs: ChangeSet, operation_id: str, id: str, name: str,
+    image_url: Optional[str], min_stock: Optional[int], content_unit_label: Optional[str],
+    brand: Optional[str] = None, quantity: Optional[float] = None, quantity_unit: Optional[str] = None,
+    category: Optional[str] = None, variant: Optional[str] = None, field_provenance: Optional[dict] = None,
+) -> dict:
+    def perform() -> dict:
+        product = Product(
+            id=id, name=name, image_url=image_url, min_stock=min_stock,
+            content_unit_label=content_unit_label, brand=brand, quantity=quantity,
+            quantity_unit=quantity_unit, category=category, variant=variant,
+            field_provenance=json.dumps(field_provenance) if field_provenance else None,
+            version=1,
+        )
+        db.add(product)
+        db.flush()
+        result = _to_dict(product)
+        cs.record("Product", id, ChangeKind.CREATE, result)
+        return result
+
+    payload = {
+        "op": "create_product", "id": id, "name": name, "imageUrl": image_url,
+        "minStock": min_stock, "contentUnitLabel": content_unit_label,
+        "brand": brand, "quantity": quantity, "quantityUnit": quantity_unit,
+        "category": category, "variant": variant, "fieldProvenance": field_provenance,
+    }
+    return run_idempotent(db, operation_id, payload, perform)
+
+
+def update_product(
+    db: Session, cs: ChangeSet, operation_id: str, id: str, name: str,
+    image_url: Optional[str], min_stock: Optional[int], content_unit_label: Optional[str], version: int,
+    brand: Optional[str] = None, quantity: Optional[float] = None, quantity_unit: Optional[str] = None,
+    category: Optional[str] = None, variant: Optional[str] = None, field_provenance: Optional[dict] = None,
+) -> dict:
+    def perform() -> dict:
+        product = db.get(Product, id)
+        if product is None or product.deleted_at is not None:
+            raise DuplicateEntityError("Product", "id", id)
+        if product.version != version:
+            raise StaleVersionError("Product", id, _to_dict(product))
+        product.name = name
+        product.image_url = image_url
+        product.min_stock = min_stock
+        product.content_unit_label = content_unit_label
+        product.brand = brand
+        product.quantity = quantity
+        product.quantity_unit = quantity_unit
+        product.category = category
+        product.variant = variant
+        product.field_provenance = json.dumps(field_provenance) if field_provenance else None
+        product.version += 1
+        db.flush()
+        result = _to_dict(product)
+        cs.record("Product", id, ChangeKind.UPDATE, result)
+        return result
+
+    payload = {
+        "op": "update_product", "id": id, "name": name, "imageUrl": image_url,
+        "minStock": min_stock, "contentUnitLabel": content_unit_label, "version": version,
+        "brand": brand, "quantity": quantity, "quantityUnit": quantity_unit,
+        "category": category, "variant": variant, "fieldProvenance": field_provenance,
+    }
+    return run_idempotent(db, operation_id, payload, perform)
+
+
+def soft_delete_product(db: Session, cs: ChangeSet, operation_id: str, id: str, version: int) -> dict:
+    def perform() -> dict:
+        product = db.get(Product, id)
+        if product is None:
+            raise DuplicateEntityError("Product", "id", id)
+        if product.version != version:
+            raise StaleVersionError("Product", id, _to_dict(product))
+        product.version += 1
+        product.deleted_at = datetime.utcnow()
+        db.flush()
+        result = _to_dict(product)
+        cs.record("Product", id, ChangeKind.UPDATE, result)
+        return result
+
+    return run_idempotent(db, operation_id, {"op": "delete_product", "id": id, "version": version}, perform)
+
+
+def backfill_deleted_product_history(db: Session) -> int:
+    """Append upserts for old product/event tombstones; caller owns the transaction.
+
+    Batch is deliberately excluded: FIFO depletion has its own DELETE path.
+    Barcode also has an independent delete operation. Neither can be repaired
+    automatically under the product-history migration's conservative policy.
+    Live upserts are untouched and a no-op does not allocate a revision.
+    """
+    from .inventory_service import (
+        _purchase_event_to_dict,
+        _consumption_event_to_dict,
+        _correction_event_to_dict,
+        _relocation_event_to_dict,
+    )
+
+    products = db.scalars(select(Product).where(Product.deleted_at.is_not(None))).all()
+    if not products:
+        return 0
+    latest_ids = (
+        select(func.max(ChangeLog.id).label("max_id"))
+        .group_by(ChangeLog.entity_type, ChangeLog.entity_id)
+        .subquery()
+    )
+    latest = {
+        (row.entity_type, row.entity_id): row.change_kind
+        for row in db.scalars(select(ChangeLog).join(latest_ids, ChangeLog.id == latest_ids.c.max_id))
+    }
+    cs = ChangeSet(db)
+    recorded = 0
+    for product in products:
+        if latest.get(("Product", product.id)) in (None, ChangeKind.DELETE.value):
+            cs.record("Product", product.id, ChangeKind.UPDATE, _to_dict(product))
+            recorded += 1
+
+    product_ids = [product.id for product in products]
+    for entity_type, model, serialize in (
+        ("PurchaseEvent", PurchaseEvent, _purchase_event_to_dict),
+        ("ConsumptionEvent", ConsumptionEvent, _consumption_event_to_dict),
+        ("CorrectionEvent", CorrectionEvent, _correction_event_to_dict),
+        ("RelocationEvent", RelocationEvent, _relocation_event_to_dict),
+    ):
+        for row in db.scalars(select(model).where(model.product_id.in_(product_ids))):
+            if latest.get((entity_type, row.id)) == ChangeKind.DELETE.value:
+                cs.record(entity_type, row.id, ChangeKind.UPDATE, serialize(row))
+                recorded += 1
+    db.flush()
+    return recorded
+
+
+def list_products(db: Session) -> list[dict]:
+    rows = db.execute(select(Product).where(Product.deleted_at.is_(None))).scalars().all()
+    return [_to_dict(r) for r in rows]

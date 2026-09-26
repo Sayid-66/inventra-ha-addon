@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Inventra Dashboard{% endblock %}
+
+{% block content %}
+  <h1>Inventra Dashboard</h1>
+  <p class="page-intro">Die Web-Oberfläche ist bereit.</p>
+
+  <section class="card status-box" aria-labelledby="system-status-heading">
+    <h2 id="system-status-heading">System- und Verbindungsstatus</h2>
+    <dl class="info-list">
+      <dt>Aktuelle Revision</dt>
+      <dd>{{ current_revision }}</dd>
+
+      <dt>Letzte Aktivität</dt>
+      <dd>
+        {% if last_activity_at %}
+          {{ last_activity_at.isoformat(sep=" ") }}
+        {% else %}
+          Noch keine Aktivität
+        {% endif %}
+      </dd>
+
+      <dt>Aktive Geräte</dt>
+      <dd>{{ active_device_count }}</dd>
+    </dl>
+  </section>
+{% endblock %}

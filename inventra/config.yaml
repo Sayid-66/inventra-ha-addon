@@ -1,0 +1,24 @@
+name: Inventra
+version: "0.1.4"
+slug: inventra
+description: Inventra central inventory backend
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8099
+homeassistant_api: true
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "Inventra API (Android app, LAN/WireGuard)"
+map:
+  - data:rw
+environment:
+  INVENTRA_DB_PATH: /data/inventra.db
+  INVENTRA_API_PORT: "8000"
+  INVENTRA_INGRESS_PORT: "8099"
+  INVENTRA_BRING_TODO_ENTITY_ID: "todo.zuhause"
+  INVENTRA_BRING_RECONCILE_INTERVAL_SECONDS: "600"

@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+
+{% block title %}{{ product.name }} – Inventra{% endblock %}
+
+{% block content %}
+  <article class="card product-card">
+    <h1>{{ product.name }}</h1>
+
+    {% if bring_watch %}
+      <div class="status-box">
+        <strong>Bring!-Status:</strong> {{ bring_watch.state }}
+        {% if bring_watch.lock_reason %}({{ bring_watch.lock_reason }}){% endif %}
+        {% if bring_watch.last_error %}<span class="confirm-actions">{{ bring_watch.last_error }}</span>{% endif %}
+      </div>
+    {% endif %}
+
+    {% if product.imageUrl %}
+      <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
+    {% endif %}
+
+    <dl class="info-list">
+      <dt>Gesamtbestand (STK)</dt>
+      <dd>{{ product.totalStk }}</dd>
+
+      {% if product.totalContent is not none %}
+        <dt>Gesamtinhalt</dt>
+        <dd>{{ product.totalContent }}{% if product.contentUnitLabel %} {{ product.contentUnitLabel }}{% endif %}</dd>
+      {% endif %}
+
+      {% if product.nextMhd %}
+        <dt>Nächstes MHD</dt>
+        <dd>{{ product.nextMhd }}</dd>
+      {% endif %}
+
+      {% if product.minStock is not none %}
+        <dt>Mindestbestand</dt>
+        <dd>{{ product.minStock }}</dd>
+      {% endif %}
+    </dl>
+
+    {% if product.stkByLocationDetailed %}
+      <h2>STK nach Lagerort</h2>
+      <ul class="stock-list">
+        {% for stock in product.stkByLocationDetailed %}
+          <li>
+            {{ stock.locationName }}: {{ stock.quantity }} STK
+            {% if stock.mhds %}(MHD: {{ stock.mhds | join(', ') }}){% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    {% if product.contentByLocation %}
+      <h2>Inhalt nach Lagerort</h2>
+      <ul class="stock-list">
+        {% for stock in product.contentByLocation %}
+          <li>{{ stock.locationName }}: {{ stock.quantity }}{% if product.contentUnitLabel %} {{ product.contentUnitLabel }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </article>
+
+  <section class="card">
+    <h2>Preise</h2>
+    {% if chart_data %}
+      <dl class="info-list">
+        <dt>Günstigster</dt>
+        <dd>{{ "%.2f" | format(cheapest_price_cents / 100) }} €</dd>
+        <dt>Durchschnitt</dt>
+        <dd>{{ "%.2f" | format(average_price_cents / 100) }} €</dd>
+        <dt>Teuerster</dt>
+        <dd>{{ "%.2f" | format(most_expensive_price_cents / 100) }} €</dd>
+      </dl>
+      <canvas class="price-chart" id="price-history-chart" aria-label="Preisentwicklung" role="img"></canvas>
+      <script>
+        const priceData = {{ chart_data | tojson }};
+        new Chart(document.getElementById("price-history-chart"), {
+          type: "line",
+          data: {
+            labels: priceData.map((entry) => entry.date),
+            datasets: [{
+              label: "Preis pro Einheit (€)",
+              data: priceData.map((entry) => entry.priceCents / 100),
+              borderColor: "#2e9b5d",
+              backgroundColor: "#2e9b5d",
+              tension: 0.2,
+            }],
+          },
+          options: {
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  callback: (value) => `${Number(value).toFixed(2)} €`,
+                },
+              },
+            },
+          },
+        });
+      </script>
+    {% else %}
+      <p class="empty-state">Noch keine Preisdaten.</p>
+    {% endif %}
+  </section>
+
+  <section class="history-section">
+    <h2>Verlauf</h2>
+    {% if product.history %}
+      {% for event in product.history %}
+        <article data-event-type="{{ event.type }}">
+          <h3>
+            {% if event.type == "PURCHASE" %}Einlagerung
+            {% elif event.type == "CONSUMPTION" %}Entnahme
+            {% elif event.type == "RELOCATION" %}Umlagerung
+            {% elif event.type == "CORRECTION" %}Korrektur
+            {% endif %}
+          </h3>
+          <time>{{ event.formattedTimestamp }}</time>
+          <dl class="info-list">
+            {% if event.type == "PURCHASE" %}
+              <dt>Menge</dt><dd>{{ event.quantity }} STK</dd>
+              <dt>Lagerort</dt><dd>{{ event.locationName }}</dd>
+              {% if event.pricePerUnitCents is not none %}
+                <dt>Preis pro Einheit</dt><dd>{{ "%.2f" | format(event.pricePerUnitCents / 100) }} €</dd>
+              {% endif %}
+              {% if event.mhd %}<dt>MHD</dt><dd>{{ event.mhd }}</dd>{% endif %}
+              {% if event.contentTotal is not none %}
+                <dt>Gesamtinhalt</dt><dd>{{ event.contentTotal }}{% if event.contentUnitLabel %} {{ event.contentUnitLabel }}{% endif %}</dd>
+              {% endif %}
+            {% elif event.type == "CONSUMPTION" %}
+              <dt>Menge</dt><dd>{{ event.quantity }}{% if event.stockKind == "STK" %} STK{% elif event.contentUnitLabel %} {{ event.contentUnitLabel }}{% endif %}</dd>
+              <dt>Lagerort</dt><dd>{{ event.locationName }}</dd>
+              <dt>Bestandsart</dt><dd>{{ event.stockKind }}</dd>
+            {% elif event.type == "RELOCATION" %}
+              <dt>Menge</dt><dd>{{ event.quantity }}{% if event.stockKind == "STK" %} STK{% elif event.contentUnitLabel %} {{ event.contentUnitLabel }}{% endif %}</dd>
+              <dt>Ausgang</dt><dd>{{ event.fromLocationName }}</dd>
+              <dt>Ziel</dt><dd>{{ event.toLocationName }}</dd>
+              <dt>Bestandsart</dt><dd>{{ event.stockKind }}</dd>
+            {% elif event.type == "CORRECTION" %}
+              <dt>Lagerort</dt><dd>{{ event.locationName }}</dd>
+              <dt>Bestandsart</dt><dd>{{ event.stockKind }}</dd>
+              <dt>Alter Bestand</dt><dd>{{ event.oldQuantity }}{% if event.stockKind == "STK" %} STK{% elif event.contentUnitLabel %} {{ event.contentUnitLabel }}{% endif %}</dd>
+              <dt>Neuer Bestand</dt><dd>{{ event.newQuantity }}{% if event.stockKind == "STK" %} STK{% elif event.contentUnitLabel %} {{ event.contentUnitLabel }}{% endif %}</dd>
+            {% endif %}
+          </dl>
+        </article>
+      {% endfor %}
+    {% else %}
+      <p class="empty-state">Noch keine Ereignisse.</p>
+    {% endif %}
+  </section>
+{% endblock %}
