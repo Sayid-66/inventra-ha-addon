@@ -4,6 +4,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .units import UnitReference
+
 
 class ProductCreateRequest(BaseModel):
     operation_id: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$", alias="operationId")
@@ -14,8 +16,11 @@ class ProductCreateRequest(BaseModel):
     content_unit_label: Optional[str] = Field(default=None, alias="contentUnitLabel")
     resolution_id: Optional[str] = Field(default=None, alias="resolutionId")
     brand: Optional[str] = None
-    quantity: Optional[float] = None
-    quantity_unit: Optional[str] = Field(default=None, alias="quantityUnit")
+    quantity: Optional[float] = Field(default=None, allow_inf_nan=False)
+    unit_id: Optional[str] = Field(default=None, alias="unitId")
+    quantity_text: Optional[str] = Field(default=None, alias="quantityText")
+    product_quantity: Optional[float] = Field(default=None, alias="productQuantity")
+    product_quantity_unit: Optional[str] = Field(default=None, alias="productQuantityUnit")
     category: Optional[str] = None
     variant: Optional[str] = None
 
@@ -31,8 +36,11 @@ class ProductUpdateRequest(BaseModel):
     version: int
     resolution_id: Optional[str] = Field(default=None, alias="resolutionId")
     brand: Optional[str] = None
-    quantity: Optional[float] = None
-    quantity_unit: Optional[str] = Field(default=None, alias="quantityUnit")
+    quantity: Optional[float] = Field(default=None, allow_inf_nan=False)
+    unit_id: Optional[str] = Field(default=None, alias="unitId")
+    quantity_text: Optional[str] = Field(default=None, alias="quantityText")
+    product_quantity: Optional[float] = Field(default=None, alias="productQuantity")
+    product_quantity_unit: Optional[str] = Field(default=None, alias="productQuantityUnit")
     category: Optional[str] = None
     variant: Optional[str] = None
 
@@ -55,8 +63,8 @@ class ProductResponse(BaseModel):
     version: int
     deleted_at: Optional[str] = Field(default=None, alias="deletedAt")
     brand: Optional[str] = None
-    quantity: Optional[float] = None
-    quantity_unit: Optional[str] = Field(default=None, alias="quantityUnit")
+    quantity: Optional[float] = Field(default=None, allow_inf_nan=False)
+    unit: Optional[UnitReference] = None
     category: Optional[str] = None
     variant: Optional[str] = None
     field_provenance: dict = Field(default_factory=dict, alias="fieldProvenance")

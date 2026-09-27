@@ -431,3 +431,39 @@ async def test_reconcile_once_does_not_crash_when_ha_unreachable(db_session):
             raise HomeAssistantApiError("down")
 
     await reconcile_once(db_session, _BrokenClient())  # must not raise
+
+
+@pytest.mark.parametrize("name,amount,unit,expected", [
+    ("Rügenwalder Bratwurst", 400, "g", "Rügenwalder Bratwurst 400 g"),
+    ("Wurst 400 g", 400, "g", "Wurst 400 g"),
+    ("Wasser 1,5l", 1.5, "l", "Wasser 1,5l"),
+    ("Wasser", 1.5, "l", "Wasser 1.5 l"),
+    ("Wurst 1400 g", 400, "g", "Wurst 1400 g 400 g"),
+])
+def test_display_name_package_size(name, amount, unit, expected):
+    assert build_display_name(name, None, None, amount, unit) == expected
+
+
+def test_display_size_is_capped_with_name():
+    result = build_display_name("Wasser " * 8, None, None, 400, "ml")
+    assert len(result) <= 60
+    assert len(build_display_name("W" * 80, None, None, 400, "ml")) == 60
+
+
+@pytest.mark.anyio
+async def test_bring_package_sizes_distinguish_conflicts(db_session):
+    from inventra_backend.db.models import Unit
+    from inventra_backend.services.unit_normalizer import STANDARD_UNIT_IDS
+
+    unit = db_session.get(Unit, STANDARD_UNIT_IDS["g"])
+    first = Product(id="size-1", name="Wurst", quantity=400, unit=unit)
+    second = Product(id="size-2", name="Wurst", quantity=500, unit=unit)
+    duplicate = Product(id="size-3", name="Wurst", quantity=400, unit=unit)
+    db_session.add_all([first, second, duplicate])
+    db_session.flush()
+    client = _FakeClient([])
+    await try_add_or_adopt(db_session, first, client)
+    await try_add_or_adopt(db_session, second, client)
+    watch = await try_add_or_adopt(db_session, duplicate, client)
+    assert client.added == ["Wurst 400 g", "Wurst 500 g"]
+    assert watch.state == BringWatchStateEnum.ERROR

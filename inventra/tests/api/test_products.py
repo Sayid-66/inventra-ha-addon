@@ -22,7 +22,7 @@ def test_create_product_minimal(api_client_with_device):
     assert body["deletedAt"] is None
     assert body["brand"] is None
     assert body["quantity"] is None
-    assert body["quantityUnit"] is None
+    assert body["unit"] is None
     assert body["category"] is None
     assert body["variant"] is None
     assert body["fieldProvenance"]["name"]["manual"] is True

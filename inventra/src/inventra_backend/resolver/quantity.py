@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..services.unit_normalizer import normalize_quantity
+
 _VOLUME_UNITS = {"ml": 1.0, "cl": 10.0, "l": 1000.0}  # base unit: ml
 _MASS_UNITS = {"g": 1.0, "kg": 1000.0}  # base unit: g
 _COUNT_UNITS = {"stk", "st"}
@@ -58,4 +60,7 @@ def parse_quantity(text: str | None) -> QuantityCandidate | None:
             amount=amount, unit=match.group("unit").lower(), pack_count=1, raw_text=trimmed,
         )
 
+    amount, unit = normalize_quantity(trimmed)
+    if amount is not None and unit is not None:
+        return QuantityCandidate(amount=amount, unit=unit.lower(), pack_count=1, raw_text=trimmed)
     return None

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from ..services.unit_normalizer import normalize_quantity
+
 
 @dataclass(frozen=True)
 class SourceCandidate:
@@ -76,10 +78,17 @@ class OpenFactsClient:
         if body.get("status") != 1 or not product:
             return SourceResult(source=self._source_id, status="NOT_FOUND", candidate=None)
 
+        amount, abbreviation = normalize_quantity(
+            amount=product.get("product_quantity"), unit_string=product.get("product_quantity_unit"),
+        )
+        # Structured OFF package totals take precedence when usable. Keep the
+        # original text as the fallback, including its multipack information.
+        quantity_text = (f"{amount:g} {abbreviation}" if amount is not None and abbreviation
+                         else product.get("quantity"))
         candidate = SourceCandidate(
             name=product.get("product_name_de") or product.get("product_name"),
             brand=_first_brand(product.get("brands")),
-            quantity_text=product.get("quantity"),
+            quantity_text=quantity_text,
             image_url=product.get("image_url"),
             category=(product.get("categories") or "").split(",")[0].strip() or None,
             variant=None,

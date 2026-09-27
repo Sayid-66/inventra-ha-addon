@@ -4,7 +4,8 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import MetaData, Table, func, inspect, select
+from types import SimpleNamespace
 from sqlalchemy.orm import Session
 
 from ..db.models import (
@@ -19,6 +20,7 @@ from ..db.models import (
 from ..errors import DuplicateEntityError, StaleVersionError
 from ..idempotency.operations import run_idempotent
 from ..revision.change_log import ChangeSet
+from .unit_service import require_unit, unit_reference
 
 
 def _to_dict(product: Product) -> dict:
@@ -30,7 +32,7 @@ def _to_dict(product: Product) -> dict:
         "contentUnitLabel": product.content_unit_label,
         "brand": product.brand,
         "quantity": product.quantity,
-        "quantityUnit": product.quantity_unit,
+        "unit": unit_reference(product.unit),
         "category": product.category,
         "variant": product.variant,
         "fieldProvenance": json.loads(product.field_provenance) if product.field_provenance else {},
@@ -46,14 +48,15 @@ def get_product(db: Session, id: str) -> Product | None:
 def create_product(
     db: Session, cs: ChangeSet, operation_id: str, id: str, name: str,
     image_url: Optional[str], min_stock: Optional[int], content_unit_label: Optional[str],
-    brand: Optional[str] = None, quantity: Optional[float] = None, quantity_unit: Optional[str] = None,
+    brand: Optional[str] = None, quantity: Optional[float] = None, unit_id: Optional[str] = None,
     category: Optional[str] = None, variant: Optional[str] = None, field_provenance: Optional[dict] = None,
 ) -> dict:
     def perform() -> dict:
+        unit = require_unit(db, unit_id)
         product = Product(
             id=id, name=name, image_url=image_url, min_stock=min_stock,
             content_unit_label=content_unit_label, brand=brand, quantity=quantity,
-            quantity_unit=quantity_unit, category=category, variant=variant,
+            unit=unit, category=category, variant=variant,
             field_provenance=json.dumps(field_provenance) if field_provenance else None,
             version=1,
         )
@@ -66,7 +69,7 @@ def create_product(
     payload = {
         "op": "create_product", "id": id, "name": name, "imageUrl": image_url,
         "minStock": min_stock, "contentUnitLabel": content_unit_label,
-        "brand": brand, "quantity": quantity, "quantityUnit": quantity_unit,
+        "brand": brand, "quantity": quantity, "unitId": unit_id,
         "category": category, "variant": variant, "fieldProvenance": field_provenance,
     }
     return run_idempotent(db, operation_id, payload, perform)
@@ -75,7 +78,7 @@ def create_product(
 def update_product(
     db: Session, cs: ChangeSet, operation_id: str, id: str, name: str,
     image_url: Optional[str], min_stock: Optional[int], content_unit_label: Optional[str], version: int,
-    brand: Optional[str] = None, quantity: Optional[float] = None, quantity_unit: Optional[str] = None,
+    brand: Optional[str] = None, quantity: Optional[float] = None, unit_id: Optional[str] = None,
     category: Optional[str] = None, variant: Optional[str] = None, field_provenance: Optional[dict] = None,
 ) -> dict:
     def perform() -> dict:
@@ -90,7 +93,7 @@ def update_product(
         product.content_unit_label = content_unit_label
         product.brand = brand
         product.quantity = quantity
-        product.quantity_unit = quantity_unit
+        product.unit = require_unit(db, unit_id)
         product.category = category
         product.variant = variant
         product.field_provenance = json.dumps(field_provenance) if field_provenance else None
@@ -103,7 +106,7 @@ def update_product(
     payload = {
         "op": "update_product", "id": id, "name": name, "imageUrl": image_url,
         "minStock": min_stock, "contentUnitLabel": content_unit_label, "version": version,
-        "brand": brand, "quantity": quantity, "quantityUnit": quantity_unit,
+        "brand": brand, "quantity": quantity, "unitId": unit_id,
         "category": category, "variant": variant, "fieldProvenance": field_provenance,
     }
     return run_idempotent(db, operation_id, payload, perform)
@@ -141,7 +144,14 @@ def backfill_deleted_product_history(db: Session) -> int:
         _relocation_event_to_dict,
     )
 
-    products = db.scalars(select(Product).where(Product.deleted_at.is_not(None))).all()
+    # 0005 invokes this repair before 0006 adds unit_id. Reflect that historical
+    # products schema only on the migration path, avoiding future ORM columns.
+    if "unit_id" not in {c["name"] for c in inspect(db.connection()).get_columns("products")}:
+        table = Table("products", MetaData(), autoload_with=db.connection())
+        products = [SimpleNamespace(**dict(row), unit=None) for row in
+                    db.execute(select(table).where(table.c.deleted_at.is_not(None))).mappings()]
+    else:
+        products = db.scalars(select(Product).where(Product.deleted_at.is_not(None))).all()
     if not products:
         return 0
     latest_ids = (

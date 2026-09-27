@@ -27,7 +27,7 @@ def test_products_table_has_resolver_columns(tmp_path):
     assert {
         "brand",
         "quantity",
-        "quantity_unit",
+        "unit_id",
         "category",
         "variant",
         "field_provenance",

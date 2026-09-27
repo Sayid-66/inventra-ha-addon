@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 import os
+import re
 from typing import Optional
 
 from sqlalchemy import select
@@ -13,7 +14,7 @@ from .bring_ha_client import BringHaClient, HomeAssistantApiError
 from .stock_query_service import build_summaries
 from ..config import get_settings
 from ..db.base import get_engine
-from ..db.models import BringWatchOrigin, BringWatchState, BringWatchStateEnum, Product
+from ..db.models import BringWatchOrigin, BringWatchState, BringWatchStateEnum, Product, Unit
 
 CONFIRMATION_MIN_ATTEMPTS = 3
 CONFIRMATION_TIMEOUT = timedelta(minutes=30)
@@ -37,7 +38,7 @@ def _find_by_uid(items: list[dict], uid: str) -> Optional[dict]:
     return None
 
 
-def build_display_name(name: str, brand: str | None, variant: str | None) -> str:
+def build_display_name(name: str, brand: str | None, variant: str | None, quantity: float | None = None, unit_abbreviation: str | None = None) -> str:
     result = name.strip()
     variant = variant.strip() if variant else ""
     brand = brand.strip() if brand else ""
@@ -45,10 +46,20 @@ def build_display_name(name: str, brand: str | None, variant: str | None) -> str
         result = f"{result} {variant}".strip()
     if brand and brand.lower() not in result.lower():
         result = f"{brand} {result}".strip()
+    if quantity is not None and unit_abbreviation:
+        amount = format(quantity, ".15g")
+        size = f"{amount} {unit_abbreviation}"
+        # Decimal comma and optional spacing are equivalent package spellings.
+        number_pattern = re.escape(amount).replace(r"\.", r"[.,]")
+        pattern = rf"(?<![\d.,]){number_pattern}\s*{re.escape(unit_abbreviation)}(?!\w)"
+        if not re.search(pattern, result, re.IGNORECASE):
+            result = f"{result} {size}".strip()
     if len(result) <= 60:
         return result
     words = result.split()
     shortened = words[0]
+    if quantity is not None and unit_abbreviation:
+        shortened = shortened[:60]
     for word in words[1:]:
         if len(shortened) + 1 + len(word) > 60:
             break
@@ -64,12 +75,13 @@ def _find_name_conflict(db: Session, product_id: str, name: str) -> Optional[str
     bring_item_name snapshot, so a stale snapshot left by a rename cannot
     block a later product that legitimately reuses the old name.
     """
-    for other_id, other_name, other_brand, other_variant in db.execute(
-        select(BringWatchState.product_id, Product.name, Product.brand, Product.variant)
+    for other_id, other_name, other_brand, other_variant, amount, abbreviation in db.execute(
+        select(BringWatchState.product_id, Product.name, Product.brand, Product.variant, Product.quantity, Unit.abbreviation)
         .join(Product, Product.id == BringWatchState.product_id)
+        .outerjoin(Unit, Unit.id == Product.unit_id)
         .where(BringWatchState.product_id != product_id)
     ):
-        if build_display_name(other_name, other_brand, other_variant) == name:
+        if build_display_name(other_name, other_brand, other_variant, amount, abbreviation) == name:
             return other_id
     return None
 
@@ -77,7 +89,7 @@ def _find_name_conflict(db: Session, product_id: str, name: str) -> Optional[str
 async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient) -> BringWatchState:
     """Called only when no bring_watch_state row exists yet for this
     product and its stock is below min_stock (spec §4.2/§4.3/§4.5)."""
-    item_name = build_display_name(product.name, product.brand, product.variant)
+    item_name = build_display_name(product.name, product.brand, product.variant, product.quantity, product.unit.abbreviation if product.unit else None)
     conflict_product_id = _find_name_conflict(db, product.id, item_name)
     if conflict_product_id is not None:
         watch = BringWatchState(

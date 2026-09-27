@@ -5,10 +5,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path
 from sqlalchemy.orm import Session
-from sqlalchemy.orm import Session as OrmSession
 
 from ..auth.device_token import require_device
-from ..db.base import get_db, get_engine
+from ..db.base import get_db
 from ..db.models import Device
 from ..resolver.provenance import derive_field_provenance
 from ..resolver.resolution_store import get_resolution
@@ -17,6 +16,8 @@ from ..schemas.products import (
     ProductCreateRequest, ProductUpdateRequest, ProductDeleteRequest, ProductResponse,
 )
 from ..services import bring_service
+from ..services.unit_normalizer import normalize_quantity, STANDARD_UNIT_IDS
+from ..services.unit_service import require_unit
 from ..services.product_service import (
     create_product, get_product, update_product, soft_delete_product, list_products,
 )
@@ -24,11 +25,34 @@ from ..services.product_service import (
 router = APIRouter(prefix="/products", tags=["products"])
 
 
-def _resolve_for_provenance(resolution_id: str | None) -> dict | None:
+def _package_size(body, db: Session, resolution: dict | None) -> tuple[float | None, str | None, str | None]:
+    if body.unit_id is not None:
+        require_unit(db, body.unit_id)
+        return body.quantity, body.unit_id, str(body.quantity) if body.quantity is not None else None
+    raw = body.quantity_text
+    # An explicitly cleared amount/unit must not be restored from a resolution.
+    if raw is None and resolution and not ({"quantity", "unit_id", "product_quantity", "product_quantity_unit"} & body.model_fields_set):
+        raw = resolution.get("proposed_fields", {}).get("quantity", {}).get("value")
+    amount, abbreviation = normalize_quantity(raw, body.product_quantity, body.product_quantity_unit)
+    if body.quantity is not None:
+        amount = body.quantity
+    # Stable seeded UUIDs let normalization keep working after both catalog
+    # labels are renamed; no stale label is copied onto a product.
+    unit_id = STANDARD_UNIT_IDS.get(abbreviation)
+    if unit_id is not None:
+        require_unit(db, unit_id)
+    submitted = raw
+    if body.product_quantity is not None and amount is not None and abbreviation:
+        submitted = f"{amount:g} {abbreviation}"
+    if body.quantity is not None:
+        submitted = str(body.quantity)
+    return amount, unit_id, submitted
+
+
+def _resolve_for_provenance(db: Session, resolution_id: str | None) -> dict | None:
     if resolution_id is None:
         return None
-    with OrmSession(get_engine()) as db:
-        return get_resolution(db, resolution_id)
+    return get_resolution(db, resolution_id)
 
 
 @router.get("", response_model=list[ProductResponse])
@@ -40,11 +64,12 @@ def list_products_route(db: Session = Depends(get_db), device: Device = Depends(
 def create_product_route(
     body: ProductCreateRequest, db: Session = Depends(get_db), device: Device = Depends(require_device),
 ):
-    resolution = _resolve_for_provenance(body.resolution_id)
+    resolution = _resolve_for_provenance(db, body.resolution_id)
+    quantity, unit_id, submitted_quantity = _package_size(body, db, resolution)
     submitted = {
         "name": body.name,
         "brand": body.brand,
-        "quantity": str(body.quantity) if body.quantity is not None else None,
+        "quantity": submitted_quantity,
         "imageUrl": body.image_url,
         "category": body.category,
         "variant": body.variant,
@@ -53,7 +78,7 @@ def create_product_route(
     with change_set(db) as cs:
         return create_product(
             db, cs, body.operation_id, body.id, body.name, body.image_url, body.min_stock,
-            body.content_unit_label, body.brand, body.quantity, body.quantity_unit,
+            body.content_unit_label, body.brand, quantity, unit_id,
             body.category, body.variant, provenance,
         )
 
@@ -69,11 +94,12 @@ def update_product_route(
         previous_provenance = {}
     else:
         previous_provenance = json.loads(product.field_provenance) if product.field_provenance else {}
-    resolution = _resolve_for_provenance(body.resolution_id)
+    resolution = _resolve_for_provenance(db, body.resolution_id)
+    quantity, unit_id, submitted_quantity = _package_size(body, db, resolution)
     submitted = {
         "name": body.name,
         "brand": body.brand,
-        "quantity": str(body.quantity) if body.quantity is not None else None,
+        "quantity": submitted_quantity,
         "imageUrl": body.image_url,
         "category": body.category,
         "variant": body.variant,
@@ -83,7 +109,7 @@ def update_product_route(
         result = update_product(
             db, cs, body.operation_id, product_id, body.name, body.image_url,
             body.min_stock, body.content_unit_label, body.version, body.brand,
-            body.quantity, body.quantity_unit, body.category, body.variant, provenance,
+            quantity, unit_id, body.category, body.variant, provenance,
         )
     background_tasks.add_task(bring_service.schedule_stock_change, product_id, False)
     return result

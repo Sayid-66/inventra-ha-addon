@@ -15,6 +15,15 @@ def _client(handler, timeout=3.0) -> OpenFactsClient:
 
 
 @pytest.mark.anyio
+async def test_structured_package_size_takes_precedence():
+    client = _client(lambda request: httpx.Response(200, json={"status": 1, "product": {
+        "quantity": "500 ml", "product_quantity": 1.5, "product_quantity_unit": "LITER",
+    }}))
+    result = await client.fetch("4006381333931")
+    assert result.candidate.quantity_text == "1.5 l"
+
+
+@pytest.mark.anyio
 async def test_found_product_maps_to_source_candidate():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v2/product/4006381333931.json"

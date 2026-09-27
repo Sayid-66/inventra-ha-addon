@@ -61,6 +61,64 @@ def _inherited_env():
     return dict(os.environ)
 
 
+def test_0006_migrates_legacy_units_and_preserves_references(tmp_path):
+    import sqlite3
+    from uuid import UUID
+    import pytest
+
+    db_path = str(tmp_path / "legacy-units.db")
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "0005_product_history"],
+        cwd=ADDON_ROOT, env={**_inherited_env(), "INVENTRA_DB_PATH": db_path}, check=True,
+    )
+    with sqlite3.connect(db_path) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("INSERT INTO locations (id, name, normalized_name, version) VALUES ('loc', 'Kitchen', 'kitchen', 1)")
+        db.execute("INSERT INTO stores (id, name, normalized_name, version) VALUES ('store', 'Shop', 'shop', 1)")
+        db.execute("INSERT INTO devices (device_id, user_id, device_name, token_hash, created_at) VALUES ('device', 'user', 'Phone', 'hash', '2026-09-27')")
+        for i, label in enumerate(["g", "GRAMM", "KG", "Dose", "dose", None, ""]):
+            db.execute("INSERT INTO products (id, name, quantity, quantity_unit, content_unit_label, version) VALUES (?, 'Test', 400, ?, 'unchanged', 1)", (str(i), label))
+        db.execute("INSERT INTO barcodes (code, product_id, version) VALUES ('123', '0', 1)")
+        db.execute("INSERT INTO purchase_events (id, product_id, timestamp, barcode, location_id, quantity, content_unit_label, user_id, source) VALUES ('purchase', '0', 1, '123', 'loc', 2, 'audit label', 'user', 'ANDROID')")
+    _migrate(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "quantity_unit" not in {r[1] for r in db.execute("PRAGMA table_info(products)")}
+        rows = db.execute("SELECT p.id, u.id, u.abbreviation, u.is_standard FROM products p LEFT JOIN units u ON p.unit_id=u.id ORDER BY p.id").fetchall()
+        assert rows[0][1] == rows[1][1]
+        assert rows[0][2:] == ("g", 1)
+        assert rows[2][2:] == ("kg", 1)
+        assert rows[3][1] == rows[4][1]
+        assert rows[3][2:] == ("Dose", 0)
+        assert rows[5][1] is None
+        assert rows[6][2:] == ("", 0)
+        assert all(UUID(r[0]).version == 7 for r in db.execute("SELECT id FROM units"))
+        assert db.execute("SELECT content_unit_label FROM purchase_events").fetchone()[0] == "audit label"
+        assert db.execute("SELECT DISTINCT quantity, content_unit_label FROM products").fetchall() == [(400, "unchanged")]
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("DELETE FROM units WHERE abbreviation='g'")
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("INSERT INTO units (id, name, abbreviation, is_standard, created_at) VALUES ('duplicate', 'Duplicate', 'G', 0, '2026-09-27')")
+        for table in ("stores", "locations", "devices", "barcodes", "purchase_events"):
+            assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1
+
+
+def test_0006_empty_products_and_downgrade(tmp_path):
+    import sqlite3
+
+    db_path = str(tmp_path / "empty-units.db")
+    _migrate(db_path)
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("SELECT count(*) FROM units WHERE is_standard=1").fetchone()[0] == 12
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "0005_product_history"],
+        cwd=ADDON_ROOT, env={**_inherited_env(), "INVENTRA_DB_PATH": db_path}, check=True,
+    )
+    _migrate(db_path)
+
+
 def test_0005_repairs_product_and_event_tombstones_via_alembic(tmp_path):
     import json
     from datetime import datetime
@@ -78,8 +136,9 @@ def test_0005_repairs_product_and_event_tombstones_via_alembic(tmp_path):
     )
     engine = configure_engine(db_path)
     with Session(engine) as db:
-        db.add(Product(id="deleted", name="Historical milk", version=2,
-                       deleted_at=datetime(2026, 9, 26, 10)))
+        from sqlalchemy import text
+        db.execute(text("INSERT INTO products (id, name, version, deleted_at) VALUES (:id, :name, :version, :deleted_at)"),
+                   {"id": "deleted", "name": "Historical milk", "version": 2, "deleted_at": datetime(2026, 9, 26, 10)})
         db.add(Location(id="loc", name="Kitchen", normalized_name="kitchen", version=1))
         db.add(PurchaseEvent(id="purchase", product_id="deleted", timestamp=123,
                              barcode="123", location_id="loc", quantity=4,

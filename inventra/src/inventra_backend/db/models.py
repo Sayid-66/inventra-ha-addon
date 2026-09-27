@@ -4,10 +4,21 @@ import enum
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
+
+
+class Unit(Base):
+    __tablename__ = "units"
+    __table_args__ = (UniqueConstraint("abbreviation", name="uq_unit_abbreviation"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    abbreviation: Mapped[str] = mapped_column(String(32, collation="NOCASE"))
+    is_standard: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Product(Base):
@@ -20,7 +31,8 @@ class Product(Base):
     content_unit_label: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     brand: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    quantity_unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    unit_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("units.id", ondelete="RESTRICT"), nullable=True)
+    unit: Mapped[Optional[Unit]] = relationship()
     category: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     variant: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     field_provenance: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

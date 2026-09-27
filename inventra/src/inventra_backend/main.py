@@ -22,6 +22,7 @@ from .api import snapshot as snapshot_api
 from .api import stock as stock_api
 from .api import stores as stores_api
 from .api import sync as sync_api
+from .api import units as units_api
 from .config import get_settings
 from .db.base import init_engine
 from .errors import install_error_handlers
@@ -57,6 +58,7 @@ def create_app(zone: Zone) -> FastAPI:
     if zone == "api":
         app.include_router(locations_api.router, prefix="/api/v1")
         app.include_router(stores_api.router, prefix="/api/v1")
+        app.include_router(units_api.router, prefix="/api/v1")
         app.include_router(products_api.router, prefix="/api/v1")
         app.include_router(product_resolver_api.router, prefix="/api/v1")
         app.include_router(barcodes_api.router, prefix="/api/v1")
