@@ -49,7 +49,7 @@ def test_relocate_same_location_rejected(api_client_with_device):
         headers=_headers(device),
     )
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "SAME_LOCATION_RELOCATION"
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
 def test_relocation_replay_same_operation_id_is_safe_noop(api_client_with_device):

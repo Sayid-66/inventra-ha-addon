@@ -104,3 +104,50 @@ def test_product_delete_removes_created_bring_item(api_client_with_device, monke
     assert items == []
     with Session(get_engine()) as db:
         assert db.get(BringWatchState, product_id) is None
+
+
+def test_product_delete_retains_watch_until_failed_removal_recovers(api_client_with_device, monkeypatch):
+    import asyncio
+    from sqlalchemy.orm import Session
+    from inventra_backend.db.base import get_engine
+    from inventra_backend.db.models import BringWatchState
+    from inventra_backend.services import bring_service as bring
+    from inventra_backend.services.bring_ha_client import HomeAssistantApiError
+    client, device = api_client_with_device
+    product_id = test_uuid('cleanup-retry')
+    headers = _headers(device)
+    assert client.post('/api/v1/products', json={'operationId': test_uuid('cleanup-retry-create'),
+                       'id': product_id, 'name': 'Water'}, headers=headers).status_code == 201
+    engine = get_engine()
+    with Session(engine) as db:
+        db.add(BringWatchState(product_id=product_id, origin='INVENTRA_CREATED',
+                              state='ON_LIST_CONFIRMED', bring_item_name='Water',
+                              bring_uid='water', retry_count=0))
+        db.commit()
+    class HaClient:
+        failing = True
+        items = [dict(uid='water', summary='Water', status='needs_action')]
+        async def get_items(self):
+            return list(self.items)
+        async def remove_item(self, uid):
+            if self.failing:
+                raise HomeAssistantApiError('unavailable')
+            self.items.clear()
+    ha = HaClient()
+    monkeypatch.setattr(bring, 'BringHaClient', lambda **kwargs: ha)
+    response = client.request('DELETE', f'/api/v1/products/{product_id}',
+                              json={'operationId': test_uuid('cleanup-retry-delete'), 'version': 1},
+                              headers=headers)
+    assert response.status_code == 200
+    with Session(engine) as db:
+        watch = db.get(BringWatchState, product_id)
+        assert watch.state == 'ON_LIST_CONFIRMED'
+        assert watch.last_error == 'REMOVE_FAILED'
+        assert watch.retry_count == 1
+    ha.failing = False
+    async def cycle():
+        await asyncio.wait_for(bring.reconcile_once(engine, ha), 2)
+    asyncio.run(cycle())
+    assert ha.items == []
+    with Session(engine) as db:
+        assert db.get(BringWatchState, product_id) is None

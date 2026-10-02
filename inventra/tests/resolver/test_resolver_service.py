@@ -44,6 +44,7 @@ def _reset(monkeypatch, tmp_path):
 async def test_known_barcode_is_served_locally_with_no_external_calls(monkeypatch):
     with Session(get_engine()) as db:
         db.add(Product(id="p1", name="Milch", version=1))
+        db.flush()
         db.add(Barcode(code="4006381333931", product_id="p1", version=1))
         db.commit()
 
@@ -123,6 +124,7 @@ async def test_gate_failed_only_field_stays_empty(monkeypatch):
 async def test_re_resolve_returns_none_for_a_barcode_not_owned_by_the_product():
     with Session(get_engine()) as db:
         db.add(Product(id="p1", name="Milch", version=1))
+        db.flush()
         db.add(Barcode(code="4006381333931", product_id="p1", version=1))
         db.commit()
 
@@ -137,6 +139,7 @@ async def test_re_resolve_diffs_against_current_product_and_respects_manual_fiel
             id="p1", name="Alte Milch", brand=None, version=1,
             field_provenance=json.dumps({"name": {"manual": True, "selectedSource": "manual"}}),
         ))
+        db.flush()
         db.add(Barcode(code="4006381333931", product_id="p1", version=1))
         db.commit()
 
@@ -163,6 +166,7 @@ async def test_re_resolve_diffs_against_current_product_and_respects_manual_fiel
 async def test_re_resolve_bypasses_but_refreshes_the_source_cache(monkeypatch):
     with Session(get_engine()) as db:
         db.add(Product(id="p1", name="Milch", version=1))
+        db.flush()
         db.add(Barcode(code="4006381333931", product_id="p1", version=1))
         db.commit()
 
@@ -198,6 +202,7 @@ async def test_re_resolve_quantity_display_and_comparison(monkeypatch, manual, p
             unit=db.get(Unit, STANDARD_UNIT_IDS["g"]),
             field_provenance=json.dumps({"quantity": {"manual": manual}}),
         ))
+        db.flush()
         db.add(Barcode(code="4006381333931", product_id="p1", version=1))
         db.commit()
 

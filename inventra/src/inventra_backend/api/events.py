@@ -27,6 +27,7 @@ def create_purchase_route(
             body.price_per_unit_cents, body.mhd, body.min_stock, body.content_unit_label,
             body.content_total, body.content_breakdown, body.timestamp,
             device.user_id, device.device_id, Source.ANDROID.value,
+            product_update=body.product_update.model_dump(exclude_unset=True) if body.product_update is not None else None,
         )
     background_tasks.add_task(bring_service.schedule_stock_change, body.product_id, True)
     return result

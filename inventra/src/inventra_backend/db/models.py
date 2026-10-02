@@ -4,7 +4,9 @@ import enum
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from uuid import uuid4
+
+from sqlalchemy import CheckConstraint, event, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -181,6 +183,20 @@ class ChangeLog(Base):
     change_kind: Mapped[str] = mapped_column(String(16))
     snapshot: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class InstanceMeta(Base):
+    __tablename__ = "instance_meta"
+    __table_args__ = (CheckConstraint("id = 0", name="ck_instance_meta_single_row"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+@event.listens_for(InstanceMeta.__table__, "after_create")
+def _seed_instance_meta(target, connection, **kwargs) -> None:
+    connection.execute(target.insert().values(id=0, instance_id=str(uuid4()), created_at=datetime.utcnow()))
 
 
 class RevisionCounter(Base):

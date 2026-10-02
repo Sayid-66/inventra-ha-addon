@@ -84,9 +84,10 @@ async def resolve(barcode: str) -> ResolveResult:
         barcode_row = find_barcode(db, barcode)
         if barcode_row is not None:
             product = get_product(db, barcode_row.product_id)
-            from ..services.product_service import _to_dict
-            db.commit()
-            return ResolveResult(matched_locally=True, product=_to_dict(product), resolution_id=None)
+            if product is not None and product.deleted_at is None:
+                from ..services.product_service import _to_dict
+                db.commit()
+                return ResolveResult(matched_locally=True, product=_to_dict(product), resolution_id=None)
         cached = get_fresh_cache_entries(db, barcode)
         db.commit()
 

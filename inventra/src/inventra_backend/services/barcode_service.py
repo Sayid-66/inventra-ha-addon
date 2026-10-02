@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from .barcode_helpers import _to_dict, tombstone_barcode
 
 from sqlalchemy.orm import Session
 
@@ -9,15 +9,6 @@ from ..db.models import Barcode, ChangeKind
 from ..errors import DuplicateEntityError, StaleVersionError
 from ..idempotency.operations import run_idempotent
 from ..revision.change_log import ChangeSet
-
-
-def _to_dict(barcode: Barcode) -> dict:
-    return {
-        "code": barcode.code,
-        "productId": barcode.product_id,
-        "version": barcode.version,
-        "deletedAt": barcode.deleted_at.isoformat() if barcode.deleted_at else None,
-    }
 
 
 def find_barcode(db: Session, code: str) -> Barcode | None:
@@ -51,11 +42,6 @@ def soft_delete_barcode(db: Session, cs: ChangeSet, operation_id: str, code: str
             raise DuplicateEntityError("Barcode", "code", code)
         if barcode.version != version:
             raise StaleVersionError("Barcode", code, _to_dict(barcode))
-        barcode.version += 1
-        barcode.deleted_at = datetime.utcnow()
-        db.flush()
-        result = _to_dict(barcode)
-        cs.record("Barcode", code, ChangeKind.DELETE, result)
-        return result
+        return tombstone_barcode(db, cs, barcode)
 
     return run_idempotent(db, operation_id, {"op": "delete_barcode", "code": code, "version": version}, perform)

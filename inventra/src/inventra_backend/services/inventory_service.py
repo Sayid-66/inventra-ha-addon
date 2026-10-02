@@ -7,7 +7,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from .ids import new_id
-from ..db.models import Batch, ChangeKind, ConsumptionEvent, CorrectionEvent, Product, PurchaseEvent, RelocationEvent
+from ..db.models import Batch, ChangeKind, ConsumptionEvent, CorrectionEvent, Location, Store, Product, PurchaseEvent, RelocationEvent
 from ..errors import BusinessRuleViolation
 from ..idempotency.operations import run_idempotent
 from ..resolver.provenance import derive_field_provenance
@@ -22,6 +22,12 @@ def _require_active_product(db: Session, product_id: str) -> Product:
             "PRODUCT_NOT_FOUND", f"product {product_id} does not exist and no newProduct was given"
         )
     return product
+
+
+def _require_active_reference(db: Session, model, entity_id: str, code: str) -> None:
+    row = db.get(model, entity_id)
+    if row is None or row.deleted_at is not None:
+        raise BusinessRuleViolation(code, "Referenced location or store does not exist or is deleted")
 
 
 def _batch_to_dict(batch: Batch) -> dict:
@@ -87,7 +93,8 @@ def _deplete_fifo(
     snapshot with the amount taken from it, in depletion order. Ported
     from InventoryDao.depleteFifo — raises, mutating nothing, if the
     pool's total is less than `amount`."""
-    assert amount > 0
+    if amount <= 0:
+        raise BusinessRuleViolation("INVALID_QUANTITY", "quantity must be positive")
     ordered = _ordered_batches(db, product_id, location_id, is_content_tracked)
     if sum(b.remaining_quantity for b in ordered) < amount:
         raise InsufficientStockError(product_id, location_id)
@@ -126,8 +133,21 @@ def commit_purchase(
     store_id: Optional[str], price_per_unit_cents: Optional[int], mhd: Optional[str],
     min_stock: Optional[int], content_unit_label: Optional[str], content_total: Optional[int],
     content_breakdown: Optional[str], timestamp: int, user_id: str, device_id: Optional[str], source: str,
+    product_update: Optional[dict] = None,
 ) -> dict:
+    """Atomically book stock and optionally apply provided product fields.
+
+    new_product ignores product_update and keeps creation/initial minStock behavior.
+    Without product_update, legacy purchases overwrite minStock from the request.
+    With product_update, top-level minStock is ignored; provided fields use
+    last-writer-wins without a version precondition. Absent keys are unchanged,
+    explicit null clears nullable fields. All product changes share one bump/log.
+    The caller owns the transaction, including rollback on any validation error.
+    """
     def perform() -> dict:
+        _require_active_reference(db, Location, location_id, "LOCATION_NOT_FOUND")
+        if store_id is not None:
+            _require_active_reference(db, Store, store_id, "STORE_NOT_FOUND")
         if new_product is None:
             product = _require_active_product(db, product_id)
         else:
@@ -163,21 +183,36 @@ def commit_purchase(
             cs.record("Barcode", barcode, ChangeKind.CREATE, {
                 "code": barcode, "productId": product.id, "version": 1, "deletedAt": None,
             })
-        elif new_product is not None and (barcode_row.deleted_at is not None or barcode_row.product_id != product.id):
-            if barcode_row.deleted_at is None:
+        else:
+            owner = db.get(Product, barcode_row.product_id)
+            owner_deleted = owner is not None and owner.deleted_at is not None
+            if new_product is not None and barcode_row.deleted_at is None and not owner_deleted and barcode_row.product_id != product.id:
                 raise BusinessRuleViolation("BARCODE_ALREADY_ASSIGNED", f"barcode {barcode} belongs to another product")
-            barcode_row.product_id = product.id
-            barcode_row.deleted_at = None
-            barcode_row.version += 1
-            db.flush()
-            cs.record("Barcode", barcode, ChangeKind.UPDATE, {
-                "code": barcode, "productId": product.id,
-                "version": barcode_row.version, "deletedAt": None,
-            })
+            if barcode_row.deleted_at is not None or owner_deleted:
+                barcode_row.product_id = product.id
+                barcode_row.deleted_at = None
+                barcode_row.version += 1
+                db.flush()
+                cs.record("Barcode", barcode, ChangeKind.UPDATE, {
+                    "code": barcode, "productId": product.id,
+                    "version": barcode_row.version, "deletedAt": None,
+                })
 
         is_content_tracked = content_unit_label is not None
+        from .product_service import apply_product_fields
         product_changed = False
-        if product.min_stock != min_stock:
+        if new_product is None and product_update is not None:
+            submitted = {
+                field: value if value is not None else ""
+                for field, value in product_update.items()
+                if field in ("name", "brand", "variant", "category")
+                and getattr(product, field) != value
+            }
+            product_changed = apply_product_fields(db, product, product_update)
+            if submitted:
+                previous = _json.loads(product.field_provenance) if product.field_provenance else {}
+                product.field_provenance = _json.dumps(derive_field_provenance(None, submitted, previous))
+        elif product.min_stock != min_stock:
             product.min_stock = min_stock
             product_changed = True
         if is_content_tracked and product.content_unit_label is None:
@@ -220,6 +255,9 @@ def commit_purchase(
         "contentUnitLabel": content_unit_label, "contentTotal": content_total,
         "contentBreakdown": content_breakdown, "timestamp": timestamp,
     }
+    # Preserve hashes of legacy operations queued before productUpdate existed.
+    if product_update is not None:
+        payload["productUpdate"] = product_update
     return run_idempotent(db, operation_id, payload, perform)
 
 
@@ -238,6 +276,7 @@ def consume(
 ) -> dict:
     def perform() -> dict:
         product = _require_active_product(db, product_id)
+        _require_active_reference(db, Location, location_id, "LOCATION_NOT_FOUND")
         is_content_tracked = stock_kind == "CONTENT"
         _deplete_fifo(db, cs, product_id, location_id, is_content_tracked, quantity)
         content_unit_label = product.content_unit_label if is_content_tracked else None
@@ -276,6 +315,9 @@ def correct_stock(
 ) -> dict:
     def perform() -> dict:
         _require_active_product(db, product_id)
+        _require_active_reference(db, Location, location_id, "LOCATION_NOT_FOUND")
+        if new_quantity < 0:
+            raise BusinessRuleViolation("INVALID_QUANTITY", "newQuantity must be non-negative")
         is_content_tracked = stock_kind == "CONTENT"
         current = _current_quantity(db, product_id, location_id, is_content_tracked)
         if new_quantity == current:
@@ -332,6 +374,8 @@ def relocate(
 ) -> dict:
     def perform() -> dict:
         product = _require_active_product(db, product_id)
+        _require_active_reference(db, Location, from_location_id, "LOCATION_NOT_FOUND")
+        _require_active_reference(db, Location, to_location_id, "LOCATION_NOT_FOUND")
         if from_location_id == to_location_id:
             raise BusinessRuleViolation("SAME_LOCATION_RELOCATION", "fromLocationId and toLocationId must differ")
 

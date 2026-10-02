@@ -46,7 +46,24 @@ def exchange_pairing_code(db: Session, operation_id: str, code: str, device_name
         return {"deviceId": device_id, "token": token}
 
     payload = {"op": "exchange_pairing_code", "code": code, "deviceName": device_name}
-    return run_idempotent(db, operation_id, payload, perform)
+    result = run_idempotent(
+        db, operation_id, payload, perform,
+        redact=lambda result: {key: value for key, value in result.items() if key != "token"},
+    )
+    if "token" not in result:
+        device = db.get(Device, result["deviceId"])
+        if device is None or device.revoked_at is not None:
+            raise BusinessRuleViolation("DEVICE_REVOKED", "device no longer exists or is revoked")
+        pairing_code = db.get(PairingCode, code)
+        if (device.last_seen_at is not None or pairing_code is None
+                or pairing_code.consumed_at is None
+                or datetime.utcnow() - pairing_code.consumed_at > timedelta(minutes=10)):
+            raise BusinessRuleViolation("PAIRING_CODE_ALREADY_USED", "pairing replay no longer permitted")
+        token = secrets.token_urlsafe(32)
+        device.token_hash = hash_token(token)
+        db.flush()
+        return {"deviceId": device.device_id, "token": token}
+    return result
 
 
 def revoke_device(db: Session, device_id: str) -> None:

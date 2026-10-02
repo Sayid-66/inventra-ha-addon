@@ -596,9 +596,11 @@ def test_setting_default_location_persists_and_shows_on_geraete_page(
     assert "Küche" in page.text
 
 
-def test_clearing_default_location_with_empty_value(ingress_client):
+@pytest.mark.parametrize("location_id", ["", "   "])
+def test_clearing_default_location_with_empty_value(ingress_client, location_id):
     with Session(get_engine()) as db:
         db.add(Location(id="l1", name="Küche", normalized_name="kueche", version=1))
+        db.flush()
         db.add(
             Device(
                 device_id="d1",
@@ -612,7 +614,7 @@ def test_clearing_default_location_with_empty_value(ingress_client):
 
     response = ingress_client.post(
         "/geraete/d1/default-location",
-        data={"locationId": ""},
+        data={"locationId": location_id},
         headers={"X-Remote-User-Id": "u1"},
         follow_redirects=False,
     )
@@ -837,6 +839,7 @@ def test_product_detail_returns_html_404_for_unknown_product(ingress_client):
 def test_produktdetail_shows_bring_watch_state(ingress_client):
     with Session(get_engine()) as db:
         db.add(Product(id="p1", name="Wasser", version=1, min_stock=3))
+        db.flush()
         db.add(
             BringWatchState(
                 product_id="p1",
@@ -988,3 +991,24 @@ async def test_api_zone_ignores_ingress_path_header():
 
     assert response.status_code == 200
     assert response.json() == {"rootPath": ""}
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_default_location_rejects_unknown_or_deleted_location(ingress_client, deleted):
+    with Session(get_engine()) as db:
+        if deleted:
+            db.add(Location(id="invalid-location", name="Deleted", normalized_name="deleted",
+                            version=1, deleted_at=datetime.utcnow()))
+            db.flush()
+        db.add(Device(device_id="d1", user_id="u1", device_name="HA",
+                      token_hash="invalid-default-location-token-hash"))
+        db.commit()
+
+    response = ingress_client.post(
+        "/geraete/d1/default-location", data={"locationId": "invalid-location"},
+        headers={"X-Remote-User-Id": "u1"}, follow_redirects=False,
+    )
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("text/html")
+    with Session(get_engine()) as db:
+        assert db.get(Device, "d1").default_location_id is None

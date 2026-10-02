@@ -31,6 +31,7 @@ def dashboard(
         name="dashboard.html",
         context={
             "current_revision": status.current_revision,
+            "instance_id": status.instance_id[:8],
             "last_activity_at": status.last_activity_at,
             "active_device_count": status.active_device_count,
         },
@@ -164,7 +165,11 @@ async def set_default_location(
         )
 
     form = parse_qs((await request.body()).decode(), keep_blank_values=True)
-    location_id = form.get("locationId", [""])[0]
+    location_id = form.get("locationId", [""])[0].strip()
+    if location_id:
+        location = db.get(Location, location_id)
+        if location is None or location.deleted_at is not None:
+            return HTMLResponse("Lagerort nicht gefunden", status_code=422)
     device.default_location_id = location_id or None
     db.commit()
     return RedirectResponse(

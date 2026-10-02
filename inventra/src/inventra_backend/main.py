@@ -25,7 +25,7 @@ from .api import stores as stores_api
 from .api import sync as sync_api
 from .api import units as units_api
 from .config import get_settings
-from .db.base import init_engine
+from .db.base import get_engine, init_engine
 from .errors import install_error_handlers
 from .services import bring_service
 from .web_templates import STATIC_DIR
@@ -93,7 +93,7 @@ async def run() -> None:
     await asyncio.gather(
         uvicorn.Server(api_config).serve(),
         uvicorn.Server(ingress_config).serve(),
-        bring_service.run_bring_reconcile_loop(settings.bring_reconcile_interval_seconds),
+        bring_service.run_bring_reconcile_loop(settings.bring_reconcile_interval_seconds, engine=get_engine()),
     )
 
 

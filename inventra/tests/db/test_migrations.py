@@ -32,7 +32,7 @@ def test_alembic_upgrade_head_creates_all_tables(tmp_path):
     expected = {
         "products", "barcodes", "locations", "stores", "batches",
         "purchase_events", "consumption_events", "correction_events",
-        "relocation_events", "change_log", "revision_counter",
+        "relocation_events", "change_log", "revision_counter", "instance_meta",
         "processed_operations", "devices", "pairing_codes",
         "mhd_warning_ack_state", "alembic_version",
     }

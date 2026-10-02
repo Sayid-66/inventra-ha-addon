@@ -122,3 +122,58 @@ def test_revoked_device_rejected_everywhere(api_client):
 
     resp = api_client.get("/api/v1/locations", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("device_state", ["active", "seen", "expired", "revoked", "missing"])
+def test_pairing_replay_rotates_token_without_persisting_it(api_client, device_state):
+    import json
+    from datetime import datetime, timedelta
+    from inventra_backend.db.base import get_engine
+    from inventra_backend.db.models import Device, PairingCode, ProcessedOperation
+
+    operation_id = test_uuid("redacted-pair")
+    payload = {"operationId": operation_id, "code": "replay-code", "deviceName": "Phone"}
+    with Session(get_engine()) as db:
+        db.add(PairingCode(code=payload["code"], user_id="dennis",
+                           expires_at=datetime.utcnow() + timedelta(minutes=5)))
+        db.commit()
+    first = api_client.post("/api/v1/pair", json=payload)
+    assert first.status_code == 201
+    result = first.json()
+    assert set(result) == {"deviceId", "token"}
+    old_token = result["token"]
+    if device_state == "seen":
+        assert api_client.get("/api/v1/locations", headers={"Authorization": f"Bearer {old_token}"}).status_code == 200
+    with Session(get_engine()) as db:
+        snapshot = db.get(ProcessedOperation, operation_id).result_snapshot
+        assert json.loads(snapshot) == {"deviceId": result["deviceId"]}
+        assert old_token not in snapshot
+        device = db.get(Device, result["deviceId"])
+        if device_state == "expired":
+            db.get(PairingCode, payload["code"]).consumed_at = datetime.utcnow() - timedelta(minutes=11)
+        if device_state == "revoked":
+            device.revoked_at = datetime.utcnow()
+        elif device_state == "missing":
+            db.delete(device)
+        db.commit()
+    mismatch = api_client.post("/api/v1/pair", json={**payload, "deviceName": "Other"})
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["code"] == "OPERATION_ID_PAYLOAD_MISMATCH"
+    replay = api_client.post("/api/v1/pair", json=payload)
+    if device_state in ("seen", "expired"):
+        assert replay.status_code == 422
+        assert replay.json()["error"]["code"] == "PAIRING_CODE_ALREADY_USED"
+        return
+    if device_state != "active":
+        assert replay.status_code == 422
+        assert replay.json()["error"]["code"] == "DEVICE_REVOKED"
+        return
+    assert replay.status_code == 201
+    assert set(replay.json()) == {"deviceId", "token"}
+    assert replay.json()["deviceId"] == result["deviceId"]
+    new_token = replay.json()["token"]
+    assert new_token != old_token
+    assert api_client.get("/api/v1/locations", headers={"Authorization": f"Bearer {old_token}"}).status_code == 401
+    assert api_client.get("/api/v1/locations", headers={"Authorization": f"Bearer {new_token}"}).status_code == 200
+    with Session(get_engine()) as db:
+        assert json.loads(db.get(ProcessedOperation, operation_id).result_snapshot) == {"deviceId": result["deviceId"]}

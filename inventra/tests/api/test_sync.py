@@ -67,3 +67,26 @@ def test_sync_pages_across_multiple_revisions_without_gaps(api_client_with_devic
         if not body["hasMore"]:
             break
     assert seen_entity_ids == [test_uuid("l1"), test_uuid("l2"), test_uuid("l3")]
+
+
+def test_sync_identity_and_rewind_contract(api_client_with_device):
+    from uuid import UUID
+    client, device = api_client_with_device
+    headers = _headers(device)
+    empty = client.get("/api/v1/sync?since_revision=1000", headers=headers).json()
+    assert UUID(empty["instanceId"]).version == 4
+    assert empty["currentRevision"] == 0
+    assert empty["nextRevision"] == 1000
+    assert empty["changes"] == []
+    assert empty["hasMore"] is False
+    client.post("/api/v1/locations", json={"operationId": test_uuid("identity-op"), "id": test_uuid("identity-loc"), "name": "Identity"}, headers=headers)
+    populated = client.get("/api/v1/sync?since_revision=0", headers=headers).json()
+    assert populated["instanceId"] == empty["instanceId"]
+    assert populated["currentRevision"] == populated["nextRevision"] == 1
+    assert len(populated["changes"]) == 1
+    rewind = client.get("/api/v1/sync?since_revision=1000", headers=headers).json()
+    assert rewind["instanceId"] == empty["instanceId"]
+    assert rewind["currentRevision"] == 1
+    assert rewind["nextRevision"] == 1000
+    assert rewind["changes"] == []
+    assert rewind["hasMore"] is False

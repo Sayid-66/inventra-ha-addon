@@ -119,26 +119,40 @@ def test_soft_delete_preserves_dependents_in_snapshot_and_delta(db_session):
         product_service.soft_delete_product(db_session, cs, "delete", ids["Product"], 1)
     db_session.flush()
     added = _change_rows(db_session, minimum_id=before[-1].id)
-    assert len(added) == 1
-    assert added[0].entity_type == "Product"
-    assert added[0].change_kind == "UPDATE"
-    assert json.loads(added[0].snapshot)["deletedAt"] is not None
+    assert len(added) == 2
+    assert len({row.revision for row in added}) == 1
+    assert added[0].entity_type == "Barcode"
+    assert added[0].entity_id == ids["Barcode"]
+    assert added[0].change_kind == "DELETE"
+    assert added[1].entity_type == "Product"
+    assert added[1].change_kind == "UPDATE"
+    assert json.loads(added[1].snapshot)["deletedAt"] is not None
     page = fetch_snapshot_page(db_session, None, None, None, limit=100)
     latest = {e["entityType"]: e for e in page["entities"]}
     assert latest["Product"]["changeKind"] == "UPDATE"
     assert latest["Product"]["snapshot"]["deletedAt"] is not None
     for old in before:
-        if old.entity_type != "Product":
+        if old.entity_type not in {"Product", "Barcode"}:
             assert latest[old.entity_type]["changeKind"] == old.change_kind
             assert latest[old.entity_type]["snapshot"] == json.loads(old.snapshot)
+    assert latest["Barcode"]["changeKind"] == "DELETE"
+    assert latest["Barcode"]["entityId"] == ids["Barcode"]
     delta = fetch_sync_page(db_session, 0, limit=100)["changes"]
-    assert [e for e in delta if e["entityType"] != "Product"] == [
+    assert [e for e in delta if e["entityType"] not in {"Product", "Barcode"}] == [
         {"revision": r.revision, "entityType": r.entity_type, "entityId": r.entity_id,
          "changeKind": r.change_kind, "snapshot": json.loads(r.snapshot)}
-        for r in before if r.entity_type != "Product"
+        for r in before if r.entity_type not in {"Product", "Barcode"}
+    ]
+    assert [e for e in delta if e["entityType"] == "Barcode"] == [
+        {"revision": r.revision, "entityType": r.entity_type, "entityId": r.entity_id,
+         "changeKind": r.change_kind, "snapshot": json.loads(r.snapshot)}
+        for r in before + added if r.entity_type == "Barcode"
     ]
     assert delta[-1]["changeKind"] == "UPDATE"
     assert delta[-1]["snapshot"]["deletedAt"] is not None
+    assert delta[-2]["entityType"] == "Barcode"
+    assert delta[-2]["entityId"] == ids["Barcode"]
+    assert delta[-2]["changeKind"] == "DELETE"
 
 
 def test_backfill_only_product_when_dependents_are_live_and_second_run_is_noop(db_session):

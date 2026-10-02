@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db.models import ChangeLog
+from .instance_service import get_current_revision, get_instance_id
 
 
 # Bump whenever a migration changes synced data without change_log entries.
@@ -22,7 +23,12 @@ def fetch_sync_page(db: Session, since_revision: int, limit: int = 200) -> dict:
     )
     rows = list(db.execute(stmt).scalars().all())
     if not rows:
-        return {"dataEpoch": SYNC_DATA_EPOCH, "changes": [], "nextRevision": since_revision, "hasMore": False}
+        return {
+            "dataEpoch": SYNC_DATA_EPOCH,
+            "instanceId": get_instance_id(db),
+            "currentRevision": get_current_revision(db),
+            "changes": [], "nextRevision": since_revision, "hasMore": False,
+        }
 
     if len(rows) <= limit:
         page_rows = rows
@@ -52,6 +58,8 @@ def fetch_sync_page(db: Session, since_revision: int, limit: int = 200) -> dict:
 
     return {
         "dataEpoch": SYNC_DATA_EPOCH,
+        "instanceId": get_instance_id(db),
+        "currentRevision": get_current_revision(db),
         "changes": [
             {
                 "revision": r.revision, "entityType": r.entity_type, "entityId": r.entity_id,

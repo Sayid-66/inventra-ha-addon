@@ -74,3 +74,53 @@ def test_retry_requires_error(api_client_with_device, state):
     assert response.json()["error"]["code"] == "BRING_NOT_IN_ERROR"
     with Session(get_engine()) as db:
         assert db.get(BringWatchState, product_id).state == state
+
+
+def test_retry_recovers_after_repeated_ha_add_failures(api_client_with_device, monkeypatch):
+    import asyncio
+    from datetime import timedelta
+    from inventra_backend.services import bring_service as bring
+    from inventra_backend.services.bring_ha_client import HomeAssistantApiError
+    client, device = api_client_with_device
+    product_id = uuid('retry-outage')
+    engine = get_engine()
+    with Session(engine) as db:
+        db.add(Product(id=product_id, name='Water', min_stock=2))
+        db.commit()
+    class HaClient:
+        failing = True
+        items = []
+        async def get_items(self):
+            with Session(engine) as db:
+                db.get(Product, product_id).name = 'Water'
+                db.commit()
+            return list(self.items)
+        async def add_item(self, name):
+            with Session(engine) as db:
+                db.get(Product, product_id).name = 'Water'
+                db.commit()
+            if self.failing:
+                raise HomeAssistantApiError('secret')
+            self.items.append(dict(uid='water', summary=name, status='needs_action'))
+    ha = HaClient()
+    monkeypatch.setattr(bring, 'BringHaClient', lambda **kwargs: ha)
+    async def cycle():
+        await asyncio.wait_for(bring.reconcile_once(engine, ha), 2)
+    asyncio.run(cycle())
+    with Session(engine) as db:
+        db.get(BringWatchState, product_id).confirmation_deadline_at = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+    asyncio.run(cycle())
+    asyncio.run(cycle())
+    with Session(engine) as db:
+        assert db.get(BringWatchState, product_id).state == 'ERROR'
+    ha.failing = False
+    response = client.post(f'/api/v1/bring/status/{product_id}/retry',
+                           headers={'Authorization': f'Bearer {device.token}'})
+    assert response.status_code == 200
+    assert response.json() == {'productId': product_id, 'state': None}
+    asyncio.run(cycle())
+    status = client.get(f'/api/v1/bring/status/{product_id}',
+                        headers={'Authorization': f'Bearer {device.token}'}).json()
+    assert status['state'] == 'ON_LIST_CONFIRMED'
+    assert status['lastError'] is None

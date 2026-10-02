@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from sqlalchemy.orm import Session
 
 from ..db.models import (
+    Barcode,
     ChangeKind,
     ChangeLog,
     ConsumptionEvent,
@@ -21,6 +22,7 @@ from ..errors import DuplicateEntityError, StaleVersionError
 from ..idempotency.operations import run_idempotent
 from ..revision.change_log import ChangeSet
 from .unit_service import require_unit, unit_reference
+from .barcode_helpers import tombstone_barcode
 
 
 _UNSET = object()
@@ -78,6 +80,23 @@ def create_product(
     return run_idempotent(db, operation_id, payload, perform)
 
 
+def apply_product_fields(db: Session, product: Product, fields: dict) -> bool:
+    """Apply provided fields without revision/log ownership; share PATCH unit lookup."""
+    changed = False
+    for field, value in fields.items():
+        if value is _UNSET:
+            continue
+        if field == "unit_id":
+            unit = require_unit(db, value)
+            if product.unit_id != value:
+                product.unit = unit
+                changed = True
+        elif getattr(product, field) != value:
+            setattr(product, field, value)
+            changed = True
+    return changed
+
+
 def update_product(
     db: Session, cs: ChangeSet, operation_id: str, id: str, version: int,
     name: Optional[str] | object = _UNSET,
@@ -99,11 +118,7 @@ def update_product(
             raise DuplicateEntityError("Product", "id", id)
         if product.version != version:
             raise StaleVersionError("Product", id, _to_dict(product))
-        for field, value in fields.items():
-            if value is not _UNSET:
-                setattr(product, field, value)
-        if unit_id is not _UNSET:
-            product.unit = require_unit(db, unit_id)
+        apply_product_fields(db, product, {**fields, "unit_id": unit_id})
         if field_provenance is not _UNSET:
             product.field_provenance = json.dumps(field_provenance) if field_provenance else None
         product.version += 1
@@ -131,6 +146,10 @@ def soft_delete_product(db: Session, cs: ChangeSet, operation_id: str, id: str, 
             raise StaleVersionError("Product", id, _to_dict(product))
         product.version += 1
         product.deleted_at = datetime.utcnow()
+        for barcode in db.scalars(select(Barcode).where(
+            Barcode.product_id == id, Barcode.deleted_at.is_(None),
+        )):
+            tombstone_barcode(db, cs, barcode)
         db.flush()
         result = _to_dict(product)
         cs.record("Product", id, ChangeKind.UPDATE, result)

@@ -50,5 +50,6 @@ def retry_status(product_id: str, background_tasks: BackgroundTasks,
     bring_service.on_product_deleted(db, product_id)
     # Background tasks run before the dependency's final commit; make deletion visible first.
     db.commit()
+    db.close()
     background_tasks.add_task(bring_service.schedule_stock_change, product_id, False)
     return {"productId": product_id, "state": None}

@@ -6,9 +6,12 @@ import logging
 import os
 import re
 from typing import Optional
+from types import SimpleNamespace
+
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, object_session
 
 from .bring_ha_client import BringHaClient, HomeAssistantApiError
@@ -102,67 +105,10 @@ def _find_name_conflict(db: Session, product_id: str, name: str) -> Optional[str
     return None
 
 
-async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient) -> BringWatchState:
-    """Called only when no bring_watch_state row exists yet for this
-    product and its stock is below min_stock (spec §4.2/§4.3/§4.5)."""
-    item_name = build_display_name(product.name, product.brand, product.variant, product.quantity, product.unit.abbreviation if product.unit else None)
-    conflict_product_id = _find_name_conflict(db, product.id, item_name)
-    if conflict_product_id is not None:
-        watch = BringWatchState(
-            product_id=product.id, state=BringWatchStateEnum.ERROR, origin=BringWatchOrigin.INVENTRA_CREATED,
-            bring_item_name=item_name, bring_uid=None, retry_count=0, confirmation_deadline_at=None,
-            last_error=f"name_conflict_with_product_id={conflict_product_id}",
-            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
-        )
-        db.add(watch)
-        db.flush()
-        return watch
-
-    try:
-        items = await client.get_items()
-    except HomeAssistantApiError:
-        # HA unreachable right now: create nothing, the next periodic
-        # reconcile cycle will retry from a clean slate (spec §5).
-        return None
-
-    claimed_uids = set(db.execute(
-        select(BringWatchState.bring_uid).where(BringWatchState.bring_uid.is_not(None))
-    ).scalars())
-    actionable_items = [
-        item for item in items
-        if item["status"] == "needs_action" and item["uid"] not in claimed_uids
-    ]
-    candidate_names = [item_name, product.name, f"{product.brand or ''} {product.name}"]
-    existing = next(
-        (match for name in candidate_names if (match := _find_by_name(actionable_items, name)) is not None),
-        None,
-    )
-    if existing is not None:
-        watch = BringWatchState(
-            product_id=product.id, state=BringWatchStateEnum.ON_LIST_CONFIRMED, origin=BringWatchOrigin.ADOPTED_EXISTING,
-            bring_item_name=existing["summary"], bring_uid=existing["uid"], retry_count=0, confirmation_deadline_at=None,
-            created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
-        )
-        db.add(watch)
-        db.flush()
-        return watch
-
-    # A historical `completed` match with this name is deliberately
-    # ignored here — only a uid WE later confirm may ever lock (§4.2).
-    watch = BringWatchState(
-        product_id=product.id, state=BringWatchStateEnum.PENDING_ADD, origin=BringWatchOrigin.INVENTRA_CREATED,
-        bring_item_name=item_name, bring_uid=None, retry_count=0,
-        confirmation_deadline_at=datetime.utcnow() + CONFIRMATION_TIMEOUT,
-        created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
-    )
-    db.add(watch)
-    db.flush()  # persisted BEFORE the external call — crash safety, spec §4.3
-
-    try:
-        await client.add_item(item_name)
-    except HomeAssistantApiError:
-        pass  # harmless: next reconcile cycle retries add_item (Bring! merges by name)
-    return watch
+async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient) -> BringWatchState | None:
+    product_id = product.id
+    await evaluate_product(db, client, product_id, _force_add=True)
+    return db.get(BringWatchState, product_id)
 
 
 def _claimed_by_others(db: Session, product_id: str) -> set[str]:
@@ -183,9 +129,11 @@ def advance_pending_add(watch: BringWatchState, items: list[dict]) -> None:
     if match is not None and match["status"] == "needs_action":
         watch.state = BringWatchStateEnum.ON_LIST_CONFIRMED
         watch.bring_uid = match["uid"]
+        watch.last_error = None
         watch.updated_at = datetime.utcnow()
         return
     watch.retry_count += 1
+    watch.last_error = "ADD_UNCONFIRMED"
     watch.updated_at = datetime.utcnow()
     deadline_elapsed = watch.confirmation_deadline_at is not None and datetime.utcnow() >= watch.confirmation_deadline_at
     if watch.retry_count >= CONFIRMATION_MIN_ATTEMPTS and deadline_elapsed:
@@ -215,141 +163,306 @@ def on_product_deleted(db: Session, product_id: str) -> None:
         db.flush()
 
 
-async def _remove_inventra_item_for_row(client, fields_or_row, claimed_uids: set[str]) -> None:
-    """Best-effort cleanup, preserving items owned by other watch rows."""
-    origin = fields_or_row.origin
-    state = fields_or_row.state
-    if origin != BringWatchOrigin.INVENTRA_CREATED or state not in (
+REMOVAL_MAX_ATTEMPTS = 10
+
+
+def _watch_marker(watch):
+    if watch is None:
+        return None
+    return (watch.state, watch.origin, watch.bring_uid, watch.bring_item_name,
+            watch.updated_at, watch.retry_count, watch.last_error)
+
+
+def _product_marker(db, product):
+    if product is None:
+        return None
+    summary = build_summary_for_product(db, product.id)
+    return (product.version, product.deleted_at, product.min_stock, product.name,
+            product.brand, product.variant, product.quantity, product.unit_id,
+            product.unit.abbreviation if product.unit else None, summary)
+
+
+# DB access in these async plan/apply flows is synchronous and short.
+# BEGIN IMMEDIATE may wait up to the 15 s busy_timeout under write contention.
+
+def _plan(db, product_id, summary=None, force_add=False, reconcile=False):
+    product = db.get(Product, product_id, populate_existing=True)
+    watch = db.get(BringWatchState, product_id, populate_existing=True)
+    marker = _product_marker(db, product)
+    action = 'none'
+    name = None
+    conflict = None
+    candidates = []
+    if product is None or product.deleted_at is not None:
+        action = 'remove' if watch is not None else 'none'
+    elif not force_add and product.min_stock in (None, 0):
+        action = ('remove' if watch.state == BringWatchStateEnum.PENDING_ADD else
+                  ('advance' if reconcile else 'clear')) if watch is not None else 'none'
+    else:
+        current = summary if summary is not None else marker[-1]
+        if not force_add and current is not None and stock_packs(product, current) >= product.min_stock:
+            if watch is not None and watch.state in (
+                BringWatchStateEnum.PENDING_ADD, BringWatchStateEnum.ON_LIST_CONFIRMED,
+            ):
+                action = 'remove'
+        elif current is not None or force_add:
+            if watch is None:
+                action = 'create'
+                name = build_display_name(product.name, product.brand, product.variant,
+                                          product.quantity, product.unit.abbreviation if product.unit else None)
+                conflict = _find_name_conflict(db, product_id, name)
+                candidates = [name, product.name, f"{product.brand or ''} {product.name}"]
+            else:
+                action = 'advance'
+    fields = None if watch is None else SimpleNamespace(
+        state=watch.state, origin=watch.origin, bring_uid=watch.bring_uid,
+        bring_item_name=watch.bring_item_name, last_error=watch.last_error)
+    return SimpleNamespace(product_id=product_id, product_marker=marker,
+                           watch_marker=_watch_marker(watch), fields=fields,
+                           claimed=_claimed_by_others(db, product_id), action=action,
+                           name=name, candidates=candidates, conflict=conflict)
+
+
+def _matches(db, plan):
+    watch = db.get(BringWatchState, plan.product_id, populate_existing=True)
+    product = db.get(Product, plan.product_id, populate_existing=True)
+    return (_watch_marker(watch) == plan.watch_marker
+            and _product_marker(db, product) == plan.product_marker
+            and _claimed_by_others(db, plan.product_id) == plan.claimed
+            and (plan.action != 'create' or
+                 _find_name_conflict(db, plan.product_id, plan.name) == plan.conflict))
+
+
+async def _remove_inventra_item_for_row(client, fields_or_row, claimed_uids: set[str], items=None) -> bool:
+    """Return False only on failure; callers retain the row for a bounded retry."""
+    if fields_or_row.origin != BringWatchOrigin.INVENTRA_CREATED or fields_or_row.state not in (
         BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchStateEnum.PENDING_ADD,
     ):
-        return
+        return True
     try:
-        items = await client.get_items()
+        if items is None:
+            items = await client.get_items()
         actionable = [item for item in items
-                      if item["status"] == "needs_action" and item["uid"] not in claimed_uids]
-        if state == BringWatchStateEnum.ON_LIST_CONFIRMED:
+                      if item['status'] == 'needs_action' and item['uid'] not in claimed_uids]
+        if fields_or_row.state == BringWatchStateEnum.ON_LIST_CONFIRMED:
             uid = fields_or_row.bring_uid
             match = _find_by_uid(actionable, uid) if uid else None
         else:
             match = _find_by_name(actionable, fields_or_row.bring_item_name)
         if match is not None:
-            await client.remove_item(match["uid"])
-    except Exception as exc:
-        logger.warning("bring deletion item cleanup failed for %s: %s", fields_or_row.bring_item_name, exc)
+            await client.remove_item(match['uid'])
+            items[:] = [item for item in items if item['uid'] != match['uid']]
+        return True
+    except HomeAssistantApiError:
+        # Never store/log HTTP exception text, which can contain credentials.
+        return False
 
 
-async def evaluate_product(db: Session, client: BringHaClient, product_id: str, summary: dict | None = None) -> None:
-    """Single entry point for both the periodic reconcile (Task 5) and
-    the immediate per-event triggers (Task 6). Implements the
-    min_stock-changed/deactivated cleanup rules from spec section 4.4.
-    Never clears a LOCKED_PURCHASED or ERROR row on its own -- only an
-    explicit stock-increase trigger (on_stock_increase, Task 6) may do
-    that, otherwise the very next cycle would re-add immediately."""
-    product = db.execute(
-        select(Product).where(Product.id == product_id).execution_options(populate_existing=True)
-    ).scalar_one_or_none()
-    watch = db.get(BringWatchState, product_id)
-    if product is None or product.deleted_at is not None:
-        if watch is not None and client is not None:
-            await _remove_inventra_item_for_row(client, watch, _claimed_by_others(db, product_id))
-        on_product_deleted(db, product_id)
+def _apply_removal(db, plan, success):
+    watch = db.get(BringWatchState, plan.product_id)
+    if success:
+        on_product_deleted(db, plan.product_id)
         return
-    if product.min_stock in (None, 0):
-        if watch is not None:
-            db.delete(watch)
-            db.flush()
+    # Count consecutive removal failures independently of add confirmations.
+    count = watch.retry_count + 1 if (watch.last_error or '').startswith('REMOVE_FAILED') else 1
+    watch.retry_count = count
+    watch.last_error = 'REMOVE_FAILED'
+    watch.updated_at = datetime.utcnow()
+    if count >= REMOVAL_MAX_ATTEMPTS:
+        logger.warning('bring removal gave up after %s attempts for product %s', count, plan.product_id)
+        on_product_deleted(db, plan.product_id)
+
+
+def _needs_items(plan):
+    if plan.action == 'create':
+        return plan.conflict is None
+    if plan.action == 'remove':
+        return (plan.fields.origin == BringWatchOrigin.INVENTRA_CREATED
+                and plan.fields.state in (BringWatchStateEnum.PENDING_ADD,
+                                          BringWatchStateEnum.ON_LIST_CONFIRMED))
+    return False
+
+
+async def _execute_plan(engine, client, plan, items, advance):
+    # All ORM work is confined to short context-managed sessions. No lazy ORM
+    # objects cross the HA boundary; plans contain only values.
+    if plan.action == 'none':
         return
-
-    if summary is None:
-        summary = build_summary_for_product(db, product_id)
-    if summary is None:
-        return
-    total = stock_packs(product, summary)
-
-    if total >= product.min_stock:
-        if watch is not None and watch.state in (
-            BringWatchStateEnum.PENDING_ADD,
-            BringWatchStateEnum.ON_LIST_CONFIRMED,
-        ):
-            # Only remove items Inventra created and confirmed by uid; an HA
-            # failure must not block local cleanup or affect adopted items.
-            if (
-                watch.state == BringWatchStateEnum.ON_LIST_CONFIRMED
-                and watch.origin == BringWatchOrigin.INVENTRA_CREATED
-                and watch.bring_uid is not None
-            ):
-                try:
-                    await client.remove_item(watch.bring_uid)
-                except HomeAssistantApiError as exc:
-                    logger.warning("bring item removal failed for product %s: %s", product_id, exc)
-            db.delete(watch)
-            db.flush()
-        return
-
-    if watch is None:
-        await try_add_or_adopt(db, product, client)
-        db.flush()
-    # PENDING_ADD/ON_LIST_CONFIRMED rows are advanced by reconcile_once
-    # against the shared get_items snapshot, not here. LOCKED_PURCHASED/
-    # ERROR rows stay untouched until a stock-increase trigger clears
-    # them (Task 6) -- that is the whole point of the lock (spec section 4.4).
-
-
-class _SnapshotClient:
-    """Reuse one HA list snapshot while retaining Task 4's add behavior."""
-
-    def __init__(self, client: BringHaClient, items: list[dict]):
-        self._client = client
-        self._items = items
-
-    async def get_items(self) -> list[dict]:
-        return self._items
-
-    async def add_item(self, name: str) -> None:
-        await self._client.add_item(name)
-
-    async def remove_item(self, uid: str) -> None:
-        await self._client.remove_item(uid)
-        self._items[:] = [item for item in self._items if item["uid"] != uid]
-
-
-async def reconcile_once(db: Session, client: BringHaClient) -> None:
-    """Run one reconcile cycle using a single HA get_items snapshot."""
-    async with _get_reconcile_lock():
-        try:
-            items = await client.get_items()
-        except HomeAssistantApiError as exc:
-            logger.warning("bring reconcile skipped, HA API unreachable: %s", exc)
+    with Session(engine) as preflight:
+        if not _matches(preflight, plan):
             return
-
-        orphaned = db.scalars(
-            select(BringWatchState).outerjoin(Product, Product.id == BringWatchState.product_id)
-            .where((Product.id.is_(None)) | (Product.deleted_at.is_not(None)))
-        ).all()
-        snapshot_client = _SnapshotClient(client, items)
-        # Keep claims from all rows until every orphan has been considered.
-        claims = {watch.product_id: _claimed_by_others(db, watch.product_id) for watch in orphaned}
-        for watch in orphaned:
-            await _remove_inventra_item_for_row(snapshot_client, watch, claims[watch.product_id])
-            db.delete(watch)
-        db.commit()
-
-        for watch in db.execute(
-            select(BringWatchState).where(BringWatchState.state == BringWatchStateEnum.PENDING_ADD)
-        ).scalars().all():
+    if plan.action == 'create':
+        actionable = [item for item in items if item['status'] == 'needs_action'
+                      and item['uid'] not in plan.claimed]
+        existing = next((match for name in plan.candidates
+                         if (match := _find_by_name(actionable, name)) is not None), None)
+        with Session(engine) as db:
+            if not _matches(db, plan):
+                return
+            now = datetime.utcnow()
+            watch = BringWatchState(
+                product_id=plan.product_id, state=BringWatchStateEnum.PENDING_ADD,
+                origin=BringWatchOrigin.INVENTRA_CREATED, bring_item_name=plan.name,
+                retry_count=0, created_at=now, updated_at=now,
+                confirmation_deadline_at=now + CONFIRMATION_TIMEOUT)
+            if plan.conflict is not None:
+                watch.state = BringWatchStateEnum.ERROR
+                watch.last_error = f'name_conflict_with_product_id={plan.conflict}'
+                watch.confirmation_deadline_at = None
+            elif existing is not None:
+                watch.state = BringWatchStateEnum.ON_LIST_CONFIRMED
+                watch.origin = BringWatchOrigin.ADOPTED_EXISTING
+                watch.bring_uid = existing['uid']
+                watch.bring_item_name = existing['summary']
+                watch.confirmation_deadline_at = None
+            db.add(watch)
+            db.flush()
+            pending = watch.state == BringWatchStateEnum.PENDING_ADD
+            plan.watch_marker = _watch_marker(watch)
+            db.commit()
+        if not pending:
+            return
+        failed = False
+        try:
+            await client.add_item(plan.name)
+        except HomeAssistantApiError:
+            failed = True
+        if failed:
+            with Session(engine) as db:
+                if _matches(db, plan):
+                    watch = db.get(BringWatchState, plan.product_id)
+                    watch.retry_count += 1
+                    watch.last_error = 'ADD_FAILED'
+                    watch.updated_at = datetime.utcnow()
+                    db.commit()
+        return
+    if plan.action == 'remove':
+        success = await _remove_inventra_item_for_row(client, plan.fields, plan.claimed, items)
+        with Session(engine) as db:
+            if _matches(db, plan):
+                _apply_removal(db, plan, success)
+                db.commit()
+        return
+    if plan.action == 'clear':
+        with Session(engine) as db:
+            if _matches(db, plan):
+                on_product_deleted(db, plan.product_id)
+                db.commit()
+        return
+    if not advance:
+        return
+    failed = False
+    if plan.fields.state == BringWatchStateEnum.PENDING_ADD:
+        # Visibility, even for a foreign claim, prevents a duplicate add. Only
+        # unclaimed UIDs may subsequently confirm ownership.
+        visible = _find_by_name(items,
+                                plan.fields.bring_item_name)
+        completed = _find_by_name([item for item in items if item['status'] == 'completed'],
+                                  plan.fields.bring_item_name)
+        if completed is not None:
+            with Session(engine) as db:
+                if _matches(db, plan):
+                    watch = db.get(BringWatchState, plan.product_id)
+                    watch.state = BringWatchStateEnum.LOCKED_PURCHASED
+                    watch.lock_reason = 'completed'
+                    watch.last_error = None
+                    watch.last_checked_at = watch.updated_at = datetime.utcnow()
+                    db.commit()
+            return
+        if visible is None or plan.fields.last_error == 'ADD_FAILED':
+            try:
+                await client.add_item(plan.fields.bring_item_name)
+            except HomeAssistantApiError:
+                failed = True
+    with Session(engine) as db:
+        if not _matches(db, plan):
+            return
+        watch = db.get(BringWatchState, plan.product_id)
+        if watch.state == BringWatchStateEnum.PENDING_ADD:
             advance_pending_add(watch, items)
-        for watch in db.execute(
-            select(BringWatchState).where(BringWatchState.state == BringWatchStateEnum.ON_LIST_CONFIRMED)
-        ).scalars().all():
+            if failed and watch.state != BringWatchStateEnum.ERROR:
+                watch.last_error = 'ADD_FAILED'
+        elif watch.state == BringWatchStateEnum.ON_LIST_CONFIRMED:
             advance_on_list_confirmed(watch, items)
+            if watch.state == BringWatchStateEnum.ON_LIST_CONFIRMED and watch.last_error:
+                watch.last_error = None
+                watch.retry_count = 0
+                watch.updated_at = datetime.utcnow()
         db.commit()
 
-        watched_ids = {row[0] for row in db.execute(select(BringWatchState.product_id)).all()}
-        for summary in build_summaries(db):
-            if summary["productId"] in watched_ids:
-                continue
-            await evaluate_product(db, snapshot_client, summary["productId"], summary=summary)
+
+def _release_session(db):
+    # Preserve values held by compatibility callers while releasing all locks.
+    expire = db.expire_on_commit
+    db.expire_on_commit = False
+    try:
         db.commit()
+    finally:
+        db.expire_on_commit = expire
+        db.close()
+
+
+async def evaluate_product(db: Session, client: BringHaClient, product_id: str, summary: dict | None = None, *, _force_add=False) -> None:
+    engine = db.get_bind()
+    plan = _plan(db, product_id, summary, _force_add)
+    _release_session(db)
+    if not _needs_items(plan):
+        await _execute_plan(engine, client, plan, [], advance=False)
+        return
+    try:
+        items = list(await client.get_items())
+    except HomeAssistantApiError:
+        if plan.action == 'remove':
+            with Session(engine) as outcome:
+                if _matches(outcome, plan):
+                    _apply_removal(outcome, plan, False)
+                    outcome.commit()
+        return
+    await _execute_plan(engine, client, plan, items, advance=False)
+
+
+async def reconcile_once(db: Session | Engine, client: BringHaClient) -> None:
+    """Serialize cycles; release SQLite before every HA await."""
+    async with _get_reconcile_lock():
+        if hasattr(db, 'get_bind'):
+            engine = db.get_bind()
+            _release_session(db)
+        else:
+            engine = db
+        try:
+            items = list(await client.get_items())
+        except HomeAssistantApiError:
+            logger.warning('bring reconcile skipped, HA API unreachable')
+            return
+        # Sweep only after fetching the list. Keep original claims throughout
+        # the sweep so deleting one orphan cannot authorize another's removal.
+        try:
+            with Session(engine) as planning:
+                orphan_ids = list(planning.scalars(
+                    select(BringWatchState.product_id).outerjoin(Product, Product.id == BringWatchState.product_id)
+                    .where((Product.id.is_(None)) | (Product.deleted_at.is_not(None)))))
+        except Exception:
+            logger.exception('bring orphan sweep planning failed')
+            orphan_ids = []
+        for product_id in orphan_ids:
+            try:
+                with Session(engine) as planning:
+                    plan = _plan(planning, product_id)
+                await _execute_plan(engine, client, plan, items, advance=False)
+            except Exception:
+                logger.exception('bring orphan cleanup failed for product %s', product_id)
+        with Session(engine) as planning:
+            summaries = build_summaries(planning)
+            product_ids = [summary['productId'] for summary in summaries]
+        # Re-read each product after previous HA actions: a stock booking or
+        # deletion during this cycle must affect subsequent decisions.
+        for product_id in product_ids:
+            try:
+                with Session(engine) as planning:
+                    plan = _plan(planning, product_id, reconcile=True)
+                await _execute_plan(engine, client, plan, items, advance=True)
+            except Exception:
+                logger.exception('bring reconcile failed for product %s', product_id)
 
 
 def on_stock_increase(db: Session, product_id: str) -> None:
@@ -369,65 +482,78 @@ def on_product_deleted_sync(product_id: str) -> None:
         db.commit()
 
 
+def _client():
+    settings = get_settings()
+    return BringHaClient(base_url=HA_CORE_API_BASE,
+                         token=os.environ.get('SUPERVISOR_TOKEN', ''),
+                         todo_entity_id=settings.bring_todo_entity_id)
+
+
 async def on_product_deleted_with_cleanup(product_id: str) -> None:
-    """Best-effort removal of Inventra-created items after product deletion."""
     async with _get_reconcile_lock():
         try:
-            with Session(get_engine()) as db:
-                fields = db.execute(select(
-                    BringWatchState.origin, BringWatchState.state,
-                    BringWatchState.bring_uid, BringWatchState.bring_item_name,
-                ).where(BringWatchState.product_id == product_id)).one_or_none()
-                claimed = _claimed_by_others(db, product_id)
-            if fields is not None:
-                origin, state, uid, name = fields
-                if origin == BringWatchOrigin.INVENTRA_CREATED and state in (
-                    BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchStateEnum.PENDING_ADD,
-                ):
-                    settings = get_settings()
-                    client = BringHaClient(
-                        base_url=HA_CORE_API_BASE,
-                        token=os.environ.get("SUPERVISOR_TOKEN", ""),
-                        todo_entity_id=settings.bring_todo_entity_id,
-                    )
-                    await _remove_inventra_item_for_row(client, fields, claimed)
-        except Exception as exc:
-            logger.warning("bring deletion cleanup failed for product %s: %s", product_id, exc)
-        finally:
-            try:
-                with Session(get_engine()) as db:
-                    on_product_deleted(db, product_id)
+            engine = get_engine()
+            with Session(engine) as db:
+                plan = _plan(db, product_id)
+            if plan.fields is None:
+                return
+            # The deletion callback also accepts an existing product for
+            # compatibility; compare its full marker before applying cleanup.
+            plan.action = 'remove'
+            if not _needs_items(plan):
+                await _execute_plan(engine, None, plan, [], advance=False)
+                return
+            client = _client()
+            items = []
+            success = True
+            if plan.fields.origin == BringWatchOrigin.INVENTRA_CREATED and plan.fields.state in (
+                BringWatchStateEnum.PENDING_ADD, BringWatchStateEnum.ON_LIST_CONFIRMED,
+            ):
+                try:
+                    items = list(await client.get_items())
+                except HomeAssistantApiError:
+                    success = False
+            with Session(engine) as preflight:
+                if not _matches(preflight, plan):
+                    return
+            if success:
+                success = await _remove_inventra_item_for_row(client, plan.fields, plan.claimed, items)
+            with Session(engine) as db:
+                if _matches(db, plan):
+                    _apply_removal(db, plan, success)
                     db.commit()
-            except Exception as exc:
-                logger.warning("bring watch deletion failed for product %s: %s", product_id, exc)
+        except Exception:
+            logger.exception('bring watch deletion failed for product %s', product_id)
 
 
 async def schedule_stock_change(product_id: str, increased: bool) -> None:
-    """BackgroundTasks entry point (spec §3.1). FastAPI runs background
-    tasks only after the response has been produced, i.e. strictly
-    after the triggering request's own `get_db` session has already
-    committed — so this never races the booking it followed. Opens its
-    own session and HA client; any failure here is logged and otherwise
-    swallowed, since the booking that triggered it already succeeded."""
-    settings = get_settings()
-    client = BringHaClient(
-        base_url=HA_CORE_API_BASE,
-        token=os.environ.get("SUPERVISOR_TOKEN", ""),
-        todo_entity_id=settings.bring_todo_entity_id,
-    )
     async with _get_reconcile_lock():
-        with Session(get_engine()) as db:
-            try:
+        try:
+            engine = get_engine()
+            with Session(engine) as db:
                 if increased:
                     on_stock_increase(db, product_id)
-                await evaluate_product(db, client, product_id)
+                plan = _plan(db, product_id)
                 db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("bring schedule_stock_change failed for product %s", product_id)
+            if not _needs_items(plan):
+                await _execute_plan(engine, None, plan, [], advance=False)
+                return
+            client = _client()
+            try:
+                items = list(await client.get_items())
+            except HomeAssistantApiError:
+                if plan.action == 'remove':
+                    with Session(engine) as db:
+                        if _matches(db, plan):
+                            _apply_removal(db, plan, False)
+                            db.commit()
+                return
+            await _execute_plan(engine, client, plan, items, advance=False)
+        except Exception:
+            logger.exception('bring schedule_stock_change failed for product %s', product_id)
 
 
-async def run_bring_reconcile_loop(interval_seconds: int) -> None:
+async def run_bring_reconcile_loop(interval_seconds: int, *, engine: Engine | None = None) -> None:
     """Runs immediately (covers Inventra restart, spec §5.6), then every
     `interval_seconds`. Never lets one bad cycle kill the loop."""
     settings = get_settings()
@@ -436,10 +562,10 @@ async def run_bring_reconcile_loop(interval_seconds: int) -> None:
         token=os.environ.get("SUPERVISOR_TOKEN", ""),
         todo_entity_id=settings.bring_todo_entity_id,
     )
+    engine = engine if engine is not None else get_engine()
     while True:
         try:
-            with Session(get_engine()) as db:
-                await reconcile_once(db, client)
+            await reconcile_once(engine, client)
         except Exception:
             logger.exception("bring reconcile loop iteration failed")
         await asyncio.sleep(interval_seconds)

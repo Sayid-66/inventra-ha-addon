@@ -26,6 +26,8 @@ def run_idempotent(
     operation_id: str,
     payload: dict,
     perform: Callable[[], dict],
+    *,
+    redact: Callable[[dict], dict] | None = None,
 ) -> dict:
     """Runs `perform` (the actual business write, which must itself add
     all its rows to `session` without committing) at most once per
@@ -46,7 +48,7 @@ def run_idempotent(
             ProcessedOperation(
                 operation_id=operation_id,
                 payload_hash=payload_hash,
-                result_snapshot=json.dumps(result),
+                result_snapshot=json.dumps(redact(result) if redact is not None else result),
             )
         )
         session.flush()

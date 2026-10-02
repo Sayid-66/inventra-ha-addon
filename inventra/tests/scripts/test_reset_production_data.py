@@ -125,7 +125,7 @@ def test_dry_run_and_safe_default_do_not_write(database):
 
 def test_confirm_cascades_via_product_tombstones_and_repeat_preserves_them(database):
     with sqlite3.connect(database) as db:
-        preserved = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in ("stores", "pairing_codes")}
+        preserved = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in ("stores", "pairing_codes", "instance_meta")}
     result = run(database, "--confirm")
     assert result.returncode == 0, result.stderr
     with sqlite3.connect(database) as db:

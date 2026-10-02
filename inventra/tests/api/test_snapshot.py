@@ -99,3 +99,26 @@ def test_snapshot_does_not_duplicate_unrelated_entities_on_an_unrelated_write(ap
     location_entities_before = [e for e in before["entities"] if e["entityType"] == "Location"]
     location_entities_after = [e for e in after["entities"] if e["entityType"] == "Location"]
     assert location_entities_before == location_entities_after  # unaffected by the unrelated Product write
+
+
+def test_snapshot_identity_and_current_counter(api_client_with_device):
+    from uuid import UUID
+    client, device = api_client_with_device
+    headers = _headers(device)
+    empty = client.get("/api/v1/snapshot", headers=headers).json()
+    assert UUID(empty["instanceId"]).version == 4
+    assert empty["currentRevision"] == 0
+    assert empty["entities"] == []
+    client.post("/api/v1/locations", json={"operationId": test_uuid("identity-op"), "id": test_uuid("identity-loc"), "name": "Identity"}, headers=headers)
+    populated = client.get("/api/v1/snapshot", headers=headers).json()
+    assert populated["instanceId"] == empty["instanceId"]
+    assert populated["currentRevision"] == 1
+    assert len(populated["entities"]) == 1
+    historical = client.get("/api/v1/snapshot?snapshot_revision=0", headers=headers).json()
+    assert historical["currentRevision"] == 1
+    assert historical["snapshotRevision"] == 0
+    assert historical["entities"] == []
+    future = client.get("/api/v1/snapshot?snapshot_revision=1000", headers=headers).json()
+    assert future["currentRevision"] == 1
+    assert future["snapshotRevision"] == 1000
+    assert future["instanceId"] == empty["instanceId"]

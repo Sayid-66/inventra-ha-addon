@@ -386,7 +386,7 @@ async def test_evaluate_product_removes_confirmed_inventra_created_item_from_bri
         "inventra_backend.services.bring_service.build_summary_for_product",
         lambda db, product_id: _total_stock_row("p1", "Wasser", 3, 5),
     )
-    client = _FakeClient(items=[])
+    client = _FakeClient(items=[{"summary": "Wasser", "uid": "uid-Wasser", "status": "needs_action"}])
 
     await evaluate_product(db_session, client, "p1")
 
@@ -593,24 +593,36 @@ async def test_evaluate_summary_paths(db_session, monkeypatch, supplied, stock):
     monkeypatch.setattr("inventra_backend.services.bring_service.build_summary_for_product", load)
     client = _FakeClient([])
     await evaluate_product(db_session, client, "p1", summary=summary if supplied else None)
-    assert calls == ([] if supplied else ["p1"])
+    assert calls and set(calls) == {"p1"}  # re-read stock before applying HA outcomes
     assert client.added == (["Wasser"] if stock == 1 else [])
     watch = db_session.get(BringWatchState, "p1")
     assert (watch.state if watch else None) == (BringWatchStateEnum.PENDING_ADD if stock == 1 else None)
 
 
 @pytest.mark.anyio
-async def test_reconcile_reuses_summary(db_session, monkeypatch):
+async def test_reconcile_rechecks_stock_and_reuses_list_snapshot(db_session, monkeypatch):
+    from inventra_backend.services import bring_service
     db_session.add(Product(id="p1", name="Wasser", min_stock=3))
     db_session.commit()
-    def unexpected(*args):
-        pytest.fail("reconcile must reuse summary")
-    monkeypatch.setattr("inventra_backend.services.bring_service.build_summary_for_product", unexpected)
-    client = _FakeClient([])
+    original = bring_service.build_summary_for_product
+    calls = []
+    def checked(db, product_id):
+        calls.append(product_id)
+        return original(db, product_id)
+    monkeypatch.setattr(bring_service, "build_summary_for_product", checked)
+    class Client(_FakeClient):
+        fetches = 0
+        async def get_items(self):
+            self.fetches += 1
+            return await super().get_items()
+    client = Client([])
     await reconcile_once(db_session, client)
     await reconcile_once(db_session, client)
+    assert calls
+    assert client.fetches == 2
     assert client.added == ["Wasser"]
     assert db_session.get(BringWatchState, "p1").state == BringWatchStateEnum.ON_LIST_CONFIRMED
+
 
 
 @pytest.mark.anyio
@@ -654,7 +666,7 @@ async def test_product_deletion_external_cleanup(db_session, monkeypatch, origin
     monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
     await bring_service.on_product_deleted_with_cleanup("cleanup")
     db_session.expire_all()
-    assert db_session.get(BringWatchState, "cleanup") is None
+    assert (db_session.get(BringWatchState, "cleanup") is None) == (failure is None)
     assert client.removed == (["milk-uid"] if expected else [])
     assert client.items == ([] if expected or status == "missing" else [{"summary": "milk", "uid": "milk-uid", "status": status}])
 
@@ -708,7 +720,7 @@ async def test_cleanup_and_confirmation_exclude_foreign_uid(db_session, monkeypa
 async def test_cleanup_waits_for_reconcile_lock(db_session, monkeypatch):
     import asyncio
     from inventra_backend.services import bring_service
-    db_session.add(Product(id="b", name="Milch", min_stock=0))
+    db_session.add(Product(id="b", name="Milch", min_stock=2))
     db_session.flush()
     db_session.add(_cleanup_watch("b"))
     db_session.commit()
@@ -763,41 +775,19 @@ async def test_reconcile_sweeps_orphan_watch_with_empty_list(db_session, missing
 @pytest.mark.anyio
 async def test_reconcile_refreshes_product_deleted_after_summaries(db_session, monkeypatch):
     from sqlalchemy.orm import Session
-    from inventra_backend.services import bring_service
-    first = Product(id="first", name="Wasser", min_stock=2)
-    victim = Product(id="victim", name="Milch", min_stock=2)
-    db_session.add_all([first, victim])
+    db_session.add_all([Product(id="first", name="Wasser", min_stock=2),
+                        Product(id="victim", name="Milch", min_stock=2)])
     db_session.commit()
-    original = bring_service.build_summaries
-    def summaries(db):
-        rows = original(db)
-        # Ensure victim remains cached with its pre-delete state.
-        db.refresh(victim)
-        return sorted(rows, key=lambda row: row["productId"])
-    monkeypatch.setattr(bring_service, "build_summaries", summaries)
-    original_evaluate = bring_service.evaluate_product
     class HookClient(_FakeClient):
-        async def get_items(self):
-            # Release BEGIN IMMEDIATE while preserving the stale identity map.
-            expire = db_session.expire_on_commit
-            db_session.expire_on_commit = False
-            try:
-                db_session.commit()
-            finally:
-                db_session.expire_on_commit = expire
-            assert victim.deleted_at is None
-            with Session(db_session.get_bind()) as second:
-                second.get(Product, "victim").deleted_at = datetime.utcnow()
-                second.commit()
-            return await super().get_items()
-    hook = HookClient([])
-    async def evaluate(db, client, product_id, summary=None):
-        if product_id == "first":
-            await hook.get_items()
-        await original_evaluate(db, client, product_id, summary)
-    monkeypatch.setattr(bring_service, "evaluate_product", evaluate)
-    client = _FakeClient([])
-    await reconcile_once(db_session, client)
+        async def add_item(self, name):
+            if name == "Wasser":
+                with Session(db_session.get_bind()) as second:
+                    second.get(Product, "victim").deleted_at = datetime.utcnow()
+                    second.commit()
+            await super().add_item(name)
+    client = HookClient([])
+    import asyncio
+    await asyncio.wait_for(reconcile_once(db_session, client), 2)
     assert client.added == ["Wasser"]
     assert db_session.get(BringWatchState, "victim") is None
 
@@ -888,7 +878,7 @@ async def test_deleted_product_paths_cleanup_before_row_deletion(
     else:
         await bring_service.schedule_stock_change("orphan", increased=False)
     db_session.expire_all()
-    assert db_session.get(BringWatchState, "orphan") is None
+    assert (db_session.get(BringWatchState, "orphan") is None) == (not failure)
     assert client.removed == (["u1"] if removed else [])
     assert client.items == ([] if removed else [item])
     if claimed:
