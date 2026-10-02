@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -46,6 +46,41 @@ def test_valid_token_authenticates(tmp_path):
         last_seen_at = db.get(Device, "d1").last_seen_at
         assert last_seen_at is not None
         assert before_request <= last_seen_at <= after_request
+
+    resp = client.get("/protected", headers={"Authorization": "Bearer secret"})
+    assert resp.status_code == 200
+    with Session(engine) as db:
+        assert db.get(Device, "d1").last_seen_at == last_seen_at
+        db.get(Device, "d1").last_seen_at = datetime.utcnow() - timedelta(minutes=6)
+        db.commit()
+    before_request = datetime.utcnow()
+    resp = client.get("/protected", headers={"Authorization": "Bearer secret"})
+    after_request = datetime.utcnow()
+    assert resp.status_code == 200
+    with Session(engine) as db:
+        assert before_request <= db.get(Device, "d1").last_seen_at <= after_request
+
+
+def test_throttled_last_seen_unchanged_and_independent_write_available(tmp_path):
+    app, engine = _make_app(tmp_path)
+    from sqlalchemy.orm import Session
+
+    last_seen_at = datetime.utcnow()
+    with Session(engine) as db:
+        db.add(Device(
+            device_id="d1", user_id="u1", device_name="Pixel",
+            token_hash=hash_token("secret"), last_seen_at=last_seen_at,
+        ))
+        db.commit()
+
+    resp = TestClient(app).get("/protected", headers={"Authorization": "Bearer secret"})
+    assert resp.status_code == 200
+    with Session(engine) as db:
+        assert db.get(Device, "d1").last_seen_at == last_seen_at
+
+    # This independent connection starts BEGIN IMMEDIATE and commits successfully.
+    with engine.begin() as connection:
+        connection.exec_driver_sql("UPDATE devices SET device_name = device_name WHERE device_id = 'd1'")
 
 
 def test_missing_token_rejected(tmp_path):

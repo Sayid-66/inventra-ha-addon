@@ -23,6 +23,9 @@ from ..revision.change_log import ChangeSet
 from .unit_service import require_unit, unit_reference
 
 
+_UNSET = object()
+
+
 def _to_dict(product: Product) -> dict:
     return {
         "id": product.id,
@@ -70,33 +73,39 @@ def create_product(
         "op": "create_product", "id": id, "name": name, "imageUrl": image_url,
         "minStock": min_stock, "contentUnitLabel": content_unit_label,
         "brand": brand, "quantity": quantity, "unitId": unit_id,
-        "category": category, "variant": variant, "fieldProvenance": field_provenance,
+        "category": category, "variant": variant,
     }
     return run_idempotent(db, operation_id, payload, perform)
 
 
 def update_product(
-    db: Session, cs: ChangeSet, operation_id: str, id: str, name: str,
-    image_url: Optional[str], min_stock: Optional[int], content_unit_label: Optional[str], version: int,
-    brand: Optional[str] = None, quantity: Optional[float] = None, unit_id: Optional[str] = None,
-    category: Optional[str] = None, variant: Optional[str] = None, field_provenance: Optional[dict] = None,
+    db: Session, cs: ChangeSet, operation_id: str, id: str, version: int,
+    name: Optional[str] | object = _UNSET,
+    image_url: Optional[str] | object = _UNSET, min_stock: Optional[int] | object = _UNSET,
+    content_unit_label: Optional[str] | object = _UNSET,
+    brand: Optional[str] | object = _UNSET, quantity: Optional[float] | object = _UNSET,
+    unit_id: Optional[str] | object = _UNSET, category: Optional[str] | object = _UNSET,
+    variant: Optional[str] | object = _UNSET, field_provenance: Optional[dict] | object = _UNSET,
 ) -> dict:
+    fields = {
+        "name": name, "image_url": image_url, "min_stock": min_stock,
+        "content_unit_label": content_unit_label, "brand": brand,
+        "quantity": quantity, "category": category, "variant": variant,
+    }
+
     def perform() -> dict:
         product = db.get(Product, id)
         if product is None or product.deleted_at is not None:
             raise DuplicateEntityError("Product", "id", id)
         if product.version != version:
             raise StaleVersionError("Product", id, _to_dict(product))
-        product.name = name
-        product.image_url = image_url
-        product.min_stock = min_stock
-        product.content_unit_label = content_unit_label
-        product.brand = brand
-        product.quantity = quantity
-        product.unit = require_unit(db, unit_id)
-        product.category = category
-        product.variant = variant
-        product.field_provenance = json.dumps(field_provenance) if field_provenance else None
+        for field, value in fields.items():
+            if value is not _UNSET:
+                setattr(product, field, value)
+        if unit_id is not _UNSET:
+            product.unit = require_unit(db, unit_id)
+        if field_provenance is not _UNSET:
+            product.field_provenance = json.dumps(field_provenance) if field_provenance else None
         product.version += 1
         db.flush()
         result = _to_dict(product)
@@ -107,8 +116,9 @@ def update_product(
         "op": "update_product", "id": id, "name": name, "imageUrl": image_url,
         "minStock": min_stock, "contentUnitLabel": content_unit_label, "version": version,
         "brand": brand, "quantity": quantity, "unitId": unit_id,
-        "category": category, "variant": variant, "fieldProvenance": field_provenance,
+        "category": category, "variant": variant,
     }
+    payload = {key: value for key, value in payload.items() if value is not _UNSET}
     return run_idempotent(db, operation_id, payload, perform)
 
 

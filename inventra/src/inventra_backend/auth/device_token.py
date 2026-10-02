@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import select
@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from ..db.base import get_db
 from ..db.models import Device
+
+LAST_SEEN_UPDATE_INTERVAL = timedelta(minutes=5)
 
 
 def hash_token(token: str) -> str:
@@ -27,6 +29,9 @@ def require_device(request: Request, db: Session = Depends(get_db)) -> Device:
     ).scalar_one_or_none()
     if device is None or device.revoked_at is not None:
         raise HTTPException(status_code=401, detail="invalid or revoked device token")
-    device.last_seen_at = datetime.utcnow()
+    now = datetime.utcnow()
+    if device.last_seen_at is None or now - device.last_seen_at > LAST_SEEN_UPDATE_INTERVAL:
+        device.last_seen_at = now
+    # Every session uses BEGIN IMMEDIATE; release its write lock even when throttled.
     db.commit()
     return device

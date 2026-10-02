@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .bring_ha_client import BringHaClient, HomeAssistantApiError
-from .stock_query_service import build_summaries
+from .stock_query_service import build_summaries, build_summary_for_product, stock_packs
 from ..config import get_settings
 from ..db.base import get_engine
 from ..db.models import BringWatchOrigin, BringWatchState, BringWatchStateEnum, Product, Unit
@@ -24,9 +24,14 @@ logger = logging.getLogger(__name__)
 _reconcile_lock = asyncio.Lock()
 
 
+def _normalize(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
 def _find_by_name(items: list[dict], name: str) -> Optional[dict]:
+    normalized_name = _normalize(name)
     for item in items:
-        if item["summary"] == name:
+        if _normalize(item["summary"]) == normalized_name:
             return item
     return None
 
@@ -81,7 +86,7 @@ def _find_name_conflict(db: Session, product_id: str, name: str) -> Optional[str
         .outerjoin(Unit, Unit.id == Product.unit_id)
         .where(BringWatchState.product_id != product_id)
     ):
-        if build_display_name(other_name, other_brand, other_variant, amount, abbreviation) == name:
+        if _normalize(build_display_name(other_name, other_brand, other_variant, amount, abbreviation)) == _normalize(name):
             return other_id
     return None
 
@@ -109,11 +114,22 @@ async def try_add_or_adopt(db: Session, product: Product, client: BringHaClient)
         # reconcile cycle will retry from a clean slate (spec §5).
         return None
 
-    existing = _find_by_name(items, item_name)
-    if existing is not None and existing["status"] == "needs_action":
+    claimed_uids = set(db.execute(
+        select(BringWatchState.bring_uid).where(BringWatchState.bring_uid.is_not(None))
+    ).scalars())
+    actionable_items = [
+        item for item in items
+        if item["status"] == "needs_action" and item["uid"] not in claimed_uids
+    ]
+    candidate_names = [item_name, product.name, f"{product.brand or ''} {product.name}"]
+    existing = next(
+        (match for name in candidate_names if (match := _find_by_name(actionable_items, name)) is not None),
+        None,
+    )
+    if existing is not None:
         watch = BringWatchState(
             product_id=product.id, state=BringWatchStateEnum.ON_LIST_CONFIRMED, origin=BringWatchOrigin.ADOPTED_EXISTING,
-            bring_item_name=item_name, bring_uid=existing["uid"], retry_count=0, confirmation_deadline_at=None,
+            bring_item_name=existing["summary"], bring_uid=existing["uid"], retry_count=0, confirmation_deadline_at=None,
             created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
         )
         db.add(watch)
@@ -168,10 +184,6 @@ def advance_on_list_confirmed(watch: BringWatchState, items: list[dict]) -> None
     # else: still needs_action, nothing changes
 
 
-def _total_stock(summary: dict) -> int:
-    return summary["totalContent"] if summary["totalContent"] is not None else summary["totalStk"]
-
-
 def on_product_deleted(db: Session, product_id: str) -> None:
     """Products are soft-deleted (Product.deleted_at), so no FK cascade
     ever fires -- this must be called explicitly from the delete route
@@ -182,7 +194,7 @@ def on_product_deleted(db: Session, product_id: str) -> None:
         db.flush()
 
 
-async def evaluate_product(db: Session, client: BringHaClient, product_id: str) -> None:
+async def evaluate_product(db: Session, client: BringHaClient, product_id: str, summary: dict | None = None) -> None:
     """Single entry point for both the periodic reconcile (Task 5) and
     the immediate per-event triggers (Task 6). Implements the
     min_stock-changed/deactivated cleanup rules from spec section 4.4.
@@ -200,10 +212,11 @@ async def evaluate_product(db: Session, client: BringHaClient, product_id: str) 
             db.flush()
         return
 
-    summary = next((s for s in build_summaries(db) if s["productId"] == product_id), None)
+    if summary is None:
+        summary = build_summary_for_product(db, product_id)
     if summary is None:
         return
-    total = _total_stock(summary)
+    total = stock_packs(product, summary)
 
     if total >= product.min_stock:
         if watch is not None and watch.state in (
@@ -275,7 +288,7 @@ async def reconcile_once(db: Session, client: BringHaClient) -> None:
         for summary in build_summaries(db):
             if summary["productId"] in watched_ids:
                 continue
-            await evaluate_product(db, snapshot_client, summary["productId"])
+            await evaluate_product(db, snapshot_client, summary["productId"], summary=summary)
         db.commit()
 
 

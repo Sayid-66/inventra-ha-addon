@@ -8,6 +8,11 @@ from sqlalchemy.orm import Session
 from ..db.models import ChangeLog
 
 
+# Bump whenever a migration changes synced data without change_log entries.
+# 2 = units catalog migration 0006.
+SYNC_DATA_EPOCH = 2
+
+
 def fetch_sync_page(db: Session, since_revision: int, limit: int = 200) -> dict:
     stmt = (
         select(ChangeLog)
@@ -17,7 +22,7 @@ def fetch_sync_page(db: Session, since_revision: int, limit: int = 200) -> dict:
     )
     rows = list(db.execute(stmt).scalars().all())
     if not rows:
-        return {"changes": [], "nextRevision": since_revision, "hasMore": False}
+        return {"dataEpoch": SYNC_DATA_EPOCH, "changes": [], "nextRevision": since_revision, "hasMore": False}
 
     if len(rows) <= limit:
         page_rows = rows
@@ -46,6 +51,7 @@ def fetch_sync_page(db: Session, since_revision: int, limit: int = 200) -> dict:
     ).first() is not None
 
     return {
+        "dataEpoch": SYNC_DATA_EPOCH,
         "changes": [
             {
                 "revision": r.revision, "entityType": r.entity_type, "entityId": r.entity_id,

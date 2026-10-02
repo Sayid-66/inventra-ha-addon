@@ -29,7 +29,7 @@ class ProductCreateRequest(BaseModel):
 
 class ProductUpdateRequest(BaseModel):
     operation_id: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$", alias="operationId")
-    name: str
+    name: Optional[str] = None
     image_url: Optional[str] = Field(default=None, alias="imageUrl")
     min_stock: Optional[int] = Field(default=None, alias="minStock")
     content_unit_label: Optional[str] = Field(default=None, alias="contentUnitLabel")

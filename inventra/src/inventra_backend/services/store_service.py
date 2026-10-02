@@ -6,8 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .location_service import normalize_name
-from ..db.models import ChangeKind, Store
-from ..errors import DuplicateEntityError, StaleVersionError
+from ..db.models import ChangeKind, PurchaseEvent, Store
+from ..errors import BusinessRuleViolation, DuplicateEntityError, StaleVersionError
 from ..idempotency.operations import run_idempotent
 from ..revision.change_log import ChangeSet
 
@@ -24,8 +24,13 @@ def _to_dict(store: Store) -> dict:
 def create_store(db: Session, cs: ChangeSet, operation_id: str, id: str, name: str) -> dict:
     def perform() -> dict:
         normalized = normalize_name(name)
-        if db.execute(select(Store).where(Store.normalized_name == normalized)).scalar_one_or_none():
+        if db.execute(select(Store).where(Store.normalized_name == normalized, Store.deleted_at.is_(None))).scalar_one_or_none():
             raise DuplicateEntityError("Store", "normalizedName", normalized)
+        # The existing global unique constraint also reserves tombstone names.
+        if db.execute(select(Store.id).where(
+            Store.normalized_name == normalized, Store.deleted_at.is_not(None)
+        ).limit(1)).first() is not None:
+            raise DuplicateEntityError("Store", "normalizedName (reserved by deleted row)", normalized)
         store = Store(id=id, name=name, normalized_name=normalized, version=1)
         db.add(store)
         db.flush()
@@ -45,9 +50,14 @@ def update_store(db: Session, cs: ChangeSet, operation_id: str, id: str, name: s
             raise StaleVersionError("Store", id, _to_dict(store))
         normalized = normalize_name(name)
         if db.execute(
-            select(Store).where(Store.normalized_name == normalized, Store.id != id)
+            select(Store).where(Store.normalized_name == normalized, Store.id != id, Store.deleted_at.is_(None))
         ).scalar_one_or_none():
             raise DuplicateEntityError("Store", "normalizedName", normalized)
+        # Renames are subject to the same global constraint as creates.
+        if db.execute(select(Store.id).where(
+            Store.normalized_name == normalized, Store.deleted_at.is_not(None)
+        ).limit(1)).first() is not None:
+            raise DuplicateEntityError("Store", "normalizedName (reserved by deleted row)", normalized)
         store.name = name
         store.normalized_name = normalized
         store.version += 1
@@ -66,6 +76,9 @@ def soft_delete_store(db: Session, cs: ChangeSet, operation_id: str, id: str, ve
             raise DuplicateEntityError("Store", "id", id)
         if store.version != version:
             raise StaleVersionError("Store", id, _to_dict(store))
+        if db.execute(select(PurchaseEvent.id).where(PurchaseEvent.store_id == id).limit(1)).first() is not None:
+            raise BusinessRuleViolation("STORE_IN_USE", "This store is referenced by purchases and cannot be deleted. You can rename it.")
+
         store.version += 1
         store.deleted_at = datetime.utcnow()
         db.flush()

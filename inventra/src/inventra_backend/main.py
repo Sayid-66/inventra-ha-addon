@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
+from .api import bring as bring_api
 from .api import barcodes as barcodes_api
 from .api import consume_by_name as consume_by_name_api
 from .api import events as events_api
@@ -60,6 +61,7 @@ def create_app(zone: Zone) -> FastAPI:
         app.include_router(stores_api.router, prefix="/api/v1")
         app.include_router(units_api.router, prefix="/api/v1")
         app.include_router(products_api.router, prefix="/api/v1")
+        app.include_router(bring_api.router, prefix="/api/v1")
         app.include_router(product_resolver_api.router, prefix="/api/v1")
         app.include_router(barcodes_api.router, prefix="/api/v1")
         app.include_router(events_api.router, prefix="/api/v1")

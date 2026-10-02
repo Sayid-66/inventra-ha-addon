@@ -46,7 +46,7 @@ def test_product_service_validates_and_switches_units(db_session):
     with change_set(db_session) as cs:
         create_product(db_session, cs, "create", "product", "Soup", None, None, None, quantity=400, unit_id=grams.id)
     with change_set(db_session) as cs:
-        result = update_product(db_session, cs, "update", "product", "Soup", None, None, None, 1, quantity=1.5, unit_id=litres.id)
+        result = update_product(db_session, cs, "update", "product", 1, "Soup", None, None, None, quantity=1.5, unit_id=litres.id)
     assert result["quantity"] == 1.5
     assert result["unit"]["abbreviation"] == "l"
     with pytest.raises(BusinessRuleViolation, match="Unknown unitId"):

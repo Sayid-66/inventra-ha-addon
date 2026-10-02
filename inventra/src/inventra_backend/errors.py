@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
@@ -84,3 +85,21 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(BusinessRuleViolation)
     async def _business_rule(request: Request, exc: BusinessRuleViolation):
         return JSONResponse({"error": {"code": exc.code, "message": str(exc)}}, status_code=422)
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            {"error": {"code": "VALIDATION_ERROR", "message": str(exc)}}, status_code=422,
+        )
+
+    @app.exception_handler(HTTPException)
+    async def _http_error(request: Request, exc: HTTPException):
+        return JSONResponse(
+            {"error": {"code": "HTTP_ERROR", "message": str(exc.detail)}}, status_code=exc.status_code,
+        )
+
+    @app.exception_handler(Exception)
+    async def _internal_error(request: Request, exc: Exception):
+        return JSONResponse(
+            {"error": {"code": "INTERNAL_ERROR", "message": "Internal server error"}}, status_code=500,
+        )

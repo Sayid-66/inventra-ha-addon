@@ -10,6 +10,7 @@ from ..config import Settings, get_settings
 from ..db.base import get_engine
 from ..services.barcode_service import find_barcode
 from ..services.product_service import get_product
+from ..services.unit_normalizer import quantity_diff
 from .cache import get_fresh_cache_entries, upsert_cache_entries
 from .resolution_store import create_resolution
 from .scoring import FieldMergeResult, merge_text_field, merge_quantity_field
@@ -157,6 +158,13 @@ async def re_resolve(product_id: str, barcode: str) -> ReResolveResult | None:
         current_value = current.get(current_value_key_map[field_name])
         proposed_value = result.value
         changed = (not is_manual) and proposed_value is not None and proposed_value != current_value
+        if field_name == "quantity":
+            current_unit = current.get("unit")
+            current_value, size_changed = quantity_diff(
+                current["quantity"], current_unit["abbreviation"] if current_unit else None,
+                proposed_value,
+            )
+            changed = (not is_manual) and proposed_value is not None and size_changed
         diff[field_name] = {
             "currentValue": current_value, "proposedValue": proposed_value if not is_manual else None,
             "source": result.selected_source, "confidence": result.confidence.value if result.confidence else None,

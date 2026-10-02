@@ -96,20 +96,30 @@ def update_product_route(
         previous_provenance = json.loads(product.field_provenance) if product.field_provenance else {}
     resolution = _resolve_for_provenance(db, body.resolution_id)
     quantity, unit_id, submitted_quantity = _package_size(body, db, resolution)
-    submitted = {
-        "name": body.name,
-        "brand": body.brand,
-        "quantity": submitted_quantity,
-        "imageUrl": body.image_url,
-        "category": body.category,
-        "variant": body.variant,
+    present = body.model_fields_set
+    updates = {
+        field: getattr(body, field)
+        for field in ("name", "image_url", "min_stock", "content_unit_label", "brand", "category", "variant")
+        if field in present
     }
+    submitted = {
+        key: getattr(body, field)
+        for field, key in (
+            ("name", "name"), ("brand", "brand"), ("image_url", "imageUrl"),
+            ("category", "category"), ("variant", "variant"),
+        )
+        if field in present
+    }
+    # Normalization remains shared with CREATE, but PATCH only applies a
+    # package size when at least one of its input fields was actually sent.
+    if {"quantity", "unit_id", "quantity_text", "product_quantity", "product_quantity_unit"} & present:
+        updates.update(quantity=quantity, unit_id=unit_id)
+        submitted["quantity"] = submitted_quantity
     provenance = derive_field_provenance(resolution, submitted, previous_provenance)
     with change_set(db) as cs:
         result = update_product(
-            db, cs, body.operation_id, product_id, body.name, body.image_url,
-            body.min_stock, body.content_unit_label, body.version, body.brand,
-            quantity, unit_id, body.category, body.variant, provenance,
+            db, cs, body.operation_id, product_id, version=body.version,
+            field_provenance=provenance, **updates,
         )
     background_tasks.add_task(bring_service.schedule_stock_change, product_id, False)
     return result

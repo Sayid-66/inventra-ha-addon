@@ -151,11 +151,14 @@ def test_0005_repairs_product_and_event_tombstones_via_alembic(tmp_path):
     _migrate(db_path)
     with Session(engine) as db:
         rows = db.scalars(select(ChangeLog).order_by(ChangeLog.id)).all()
-        assert [r.change_kind for r in rows] == ["DELETE", "DELETE", "UPDATE", "UPDATE"]
+        assert [r.change_kind for r in rows] == ["DELETE", "DELETE", "UPDATE", "UPDATE", "UPDATE"]
         assert json.loads(rows[2].snapshot)["deletedAt"] == "2026-09-26T10:00:00"
         assert json.loads(rows[3].snapshot)["quantity"] == 4
         assert rows[2].revision == rows[3].revision > rows[1].revision
+        assert rows[4].entity_type == "Product"
+        assert rows[4].revision > rows[3].revision
+        assert json.loads(rows[4].snapshot)["deletedAt"] == "2026-09-26T10:00:00"
     _migrate(db_path)
     with Session(engine) as db:
-        assert len(db.scalars(select(ChangeLog)).all()) == 4
+        assert len(db.scalars(select(ChangeLog)).all()) == 5
     engine.dispose()

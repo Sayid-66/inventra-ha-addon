@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+from math import ceil
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db.models import (
     Batch, ConsumptionEvent, CorrectionEvent, Location, Product, PurchaseEvent, RelocationEvent,
 )
+from .unit_normalizer import canonical_unit
+
+
+def stock_packs(product: Product, summary: dict) -> int:
+    """Count pieces plus remaining content expressed as whole packages."""
+    packs = summary["totalStk"]
+    content = summary["totalContent"] or 0
+    if content > 0:
+        content_unit = canonical_unit(product.content_unit_label)
+        if (
+            product.quantity and product.quantity > 0 and product.unit is not None
+            and content_unit is not None
+            and content_unit == canonical_unit(product.unit.abbreviation)
+        ):
+            packs += ceil(content / product.quantity)
+        else:
+            packs += 1
+    return packs
 
 
 def _location_name(locations_by_id: dict, location_id: str) -> str:
@@ -27,6 +47,17 @@ def build_summaries(db: Session) -> list[dict]:
         product_batches = batches_by_product.get(product.id, [])
         summaries.append(_build_summary(product, product_batches, locations_by_id))
     return summaries
+
+
+def build_summary_for_product(db: Session, product_id: str) -> dict | None:
+    product = db.execute(
+        select(Product).where(Product.id == product_id, Product.deleted_at.is_(None))
+    ).scalar_one_or_none()
+    if product is None:
+        return None
+    batches = db.execute(select(Batch).where(Batch.product_id == product_id)).scalars().all()
+    locations_by_id = {l.id: l for l in db.execute(select(Location)).scalars().all()}
+    return _build_summary(product, batches, locations_by_id)
 
 
 def _build_summary(product: Product, batches: list[Batch], locations_by_id: dict) -> dict:

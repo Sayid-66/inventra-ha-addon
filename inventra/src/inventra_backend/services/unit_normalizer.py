@@ -35,6 +35,33 @@ def _unit(value) -> str | None:
     return _ALIASES.get(value.strip().rstrip(".").casefold()) if isinstance(value, str) else None
 
 
+def canonical_unit(value: str | None) -> str | None:
+    """Return the canonical abbreviation for a recognized unit label."""
+    return _unit(value)
+
+
+def quantity_diff(
+    current_amount: float | None, current_unit: str | None, proposed_text: str | None,
+) -> tuple[str | None, bool]:
+    """Display the current package size and compare without converting units."""
+    display = None
+    if current_amount is not None:
+        display = f"{current_amount:g}"
+        if current_unit:
+            display += f" {current_unit}"
+    if proposed_text is None:
+        return display, False
+    proposed_amount, proposed_unit = normalize_quantity(proposed_text)
+    if proposed_amount is None:
+        return display, proposed_text != display
+    same_size = (
+        current_amount is not None
+        and math.isclose(proposed_amount, current_amount, rel_tol=1e-9, abs_tol=1e-9)
+        and proposed_unit == canonical_unit(current_unit)
+    )
+    return display, not same_size
+
+
 def normalize_quantity(
     text: str | None = None, amount: float | None = None, unit_string: str | None = None,
 ) -> tuple[float | None, str | None]:

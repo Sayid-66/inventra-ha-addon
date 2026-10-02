@@ -11,6 +11,7 @@ def test_sync_from_zero_returns_all_changes_in_one_call(api_client_with_device):
     resp = client.get("/api/v1/sync?since_revision=0", headers=_headers(device))
     assert resp.status_code == 200
     body = resp.json()
+    assert body["dataEpoch"] == 2
     assert len(body["changes"]) == 1
     assert body["changes"][0]["entityType"] == "Location"
     assert body["hasMore"] is False
@@ -18,6 +19,7 @@ def test_sync_from_zero_returns_all_changes_in_one_call(api_client_with_device):
 
     resp2 = client.get(f"/api/v1/sync?since_revision={next_revision}", headers=_headers(device))
     assert resp2.json()["changes"] == []
+    assert resp2.json()["dataEpoch"] == 2
 
 
 def test_sync_never_splits_one_revision_even_with_a_small_limit(api_client_with_device):
@@ -41,6 +43,7 @@ def test_sync_never_splits_one_revision_even_with_a_small_limit(api_client_with_
     )
     resp = client.get("/api/v1/sync?since_revision=1&limit=2", headers=_headers(device))
     body = resp.json()
+    assert body["dataEpoch"] == 2
     revisions_seen = {c["revision"] for c in body["changes"]}
     assert len(revisions_seen) == 1  # exactly one revision, fully delivered, even though limit was 2
     assert len(body["changes"]) == 4
@@ -58,6 +61,7 @@ def test_sync_pages_across_multiple_revisions_without_gaps(api_client_with_devic
     for _ in range(10):  # generous upper bound on round-trips
         resp = client.get(f"/api/v1/sync?since_revision={since}&limit=1", headers=_headers(device))
         body = resp.json()
+        assert body["dataEpoch"] == 2
         seen_entity_ids += [c["entityId"] for c in body["changes"]]
         since = body["nextRevision"]
         if not body["hasMore"]:

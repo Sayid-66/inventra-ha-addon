@@ -181,3 +181,38 @@ async def test_re_resolve_bypasses_but_refreshes_the_source_cache(monkeypatch):
     # already exists for it.
     await resolver_service.re_resolve("p1", "4006381333931")
     assert calls["count"] == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("manual,proposed,changed", [
+    (False, "500 g", False), (False, "750 g", True), (True, "750 g", False),
+])
+async def test_re_resolve_quantity_display_and_comparison(monkeypatch, manual, proposed, changed):
+    from inventra_backend.db.models import Unit
+    from inventra_backend.services.unit_normalizer import STANDARD_UNIT_IDS
+    from inventra_backend.resolver.source_client import SourceResult, SourceCandidate
+
+    with Session(get_engine()) as db:
+        db.add(Product(
+            id="p1", name="Mehl", quantity=500.0,
+            unit=db.get(Unit, STANDARD_UNIT_IDS["g"]),
+            field_provenance=json.dumps({"quantity": {"manual": manual}}),
+        ))
+        db.add(Barcode(code="4006381333931", product_id="p1", version=1))
+        db.commit()
+
+    async def fake_fetch(barcode, settings):
+        return {
+            s.source_id: SourceResult(
+                s.source_id, "FOUND",
+                SourceCandidate("Mehl", None, proposed, None, None, None),
+            ) for s in ALL_SOURCES
+        }
+
+    monkeypatch.setattr(resolver_service, "_fetch_all_sources", fake_fetch)
+    result = await resolver_service.re_resolve("p1", "4006381333931")
+    assert result.diff["quantity"]["currentValue"] == "500 g"
+    assert isinstance(result.diff["quantity"]["currentValue"], str)
+    assert result.diff["quantity"]["changed"] is changed
+    assert result.diff["quantity"]["manual"] is manual
+    assert result.diff["quantity"]["proposedValue"] == (None if manual else proposed)

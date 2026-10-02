@@ -6,6 +6,7 @@ from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
 from ..db.models import ChangeLog
+from .sync_service import SYNC_DATA_EPOCH
 
 
 def get_current_max_revision(db: Session) -> int:
@@ -45,6 +46,7 @@ def fetch_snapshot_page(
         next_cursor = {"entityType": page_rows[-1].entity_type, "entityId": page_rows[-1].entity_id}
 
     return {
+        "dataEpoch": SYNC_DATA_EPOCH,
         "snapshotRevision": snapshot_revision,
         "entities": [
             {

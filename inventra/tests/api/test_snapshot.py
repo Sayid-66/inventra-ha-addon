@@ -11,6 +11,7 @@ def test_snapshot_first_page_fixes_the_revision_for_later_pages(api_client_with_
 
     first = client.get("/api/v1/snapshot?limit=1", headers=_headers(device))
     body = first.json()
+    assert body["dataEpoch"] == 2
     snapshot_revision = body["snapshotRevision"]
     assert len(body["entities"]) == 1
     assert body["nextCursor"] is None  # only one entity exists so far — snapshot already complete
@@ -39,6 +40,7 @@ def test_snapshot_paginates_by_entity_cursor_without_gaps_or_duplicates(api_clie
             headers=_headers(device),
         )
         body = resp.json()
+        assert body["dataEpoch"] == 2
         seen_ids += [e["entityId"] for e in body["entities"]]
         cursor = body["nextCursor"]
     assert sorted(seen_ids) == [test_uuid("l1"), test_uuid("l0"), test_uuid("l2")]
