@@ -51,21 +51,53 @@ def test_used_master_data_delete_is_422_without_changes(api_client_with_device, 
         assert entity.deleted_at is None
 
 
+
 @pytest.mark.parametrize("kind", ["locations", "stores"])
-def test_deleted_name_is_reserved_by_existing_global_unique_constraint(api_client_with_device, kind):
-    # Contract deviation: name reuse requires a migration, which this task forbids.
+def test_deleted_names_can_be_reused(api_client_with_device, kind):
     client, device = api_client_with_device
     headers = {"Authorization": f"Bearer {device.token}"}
-    entity_id = test_uuid("original")
-    assert client.post(f"/api/v1/{kind}", json={"operationId": test_uuid("create"), "id": entity_id, "name": "Keller"}, headers=headers).status_code == 201
-    assert client.request("DELETE", f"/api/v1/{kind}/{entity_id}", json={"operationId": test_uuid("delete"), "version": 1}, headers=headers).status_code == 200
-    response = client.post(f"/api/v1/{kind}", json={"operationId": test_uuid("reuse"), "id": test_uuid("new"), "name": " KELLER "}, headers=headers)
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "DUPLICATE_ENTITY"
-    assert "reserved by deleted row" in response.json()["error"]["message"]
+    def create(label, name):
+        return client.post(f"/api/v1/{kind}", json={"operationId": test_uuid(label + "-create"), "id": test_uuid(label), "name": name}, headers=headers)
+    def delete(label):
+        response = client.request("DELETE", f"/api/v1/{kind}/{test_uuid(label)}", json={"operationId": test_uuid(label + "-delete"), "version": 1}, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["name"] == "Keller"
+        assert "normalized_name" not in response.json()
+    assert create("original", "Keller").status_code == 201
+    delete("original")
+    assert create("replacement", "Keller").status_code == 201
+    assert create("duplicate", " KELLER ").status_code == 409
+    delete("replacement")
+    assert create("other", "Other").status_code == 201
+    renamed = client.patch(f"/api/v1/{kind}/{test_uuid('other')}", json={"operationId": test_uuid("rename"), "name": "KELLER", "version": 1}, headers=headers)
+    assert renamed.status_code == 200
+    assert create("live-clash", "Keller").status_code == 409
+    assert create("another", "Another").status_code == 201
+    assert client.patch(f"/api/v1/{kind}/{test_uuid('another')}", json={"operationId": test_uuid("clash-rename"), "name": "Keller", "version": 1}, headers=headers).status_code == 409
+    with Session(get_engine()) as db:
+        model = Location if kind == "locations" else Store
+        for label in ("original", "replacement"):
+            row = db.get(model, test_uuid(label))
+            assert row.name == "Keller"
+            assert row.normalized_name == f"~deleted~{row.id}~keller"
+        import json
+        snapshots = [json.loads(row.snapshot) for row in db.scalars(select(ChangeLog)).all()]
+        assert all("normalized_name" not in row and "normalizedName" not in row for row in snapshots)
 
-    second_id = test_uuid("second")
-    assert client.post(f"/api/v1/{kind}", json={"operationId": test_uuid("second-create"), "id": second_id, "name": "Other"}, headers=headers).status_code == 201
-    renamed = client.patch(f"/api/v1/{kind}/{second_id}", json={"operationId": test_uuid("rename"), "name": "KELLER", "version": 1}, headers=headers)
-    assert renamed.status_code == 409
-    assert "reserved by deleted row" in renamed.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("kind", ["locations", "stores"])
+def test_repeated_delete_refuses_tombstone(db_session, kind):
+    from inventra_backend.errors import DuplicateEntityError
+    from inventra_backend.revision.change_log import ChangeSet
+    from inventra_backend.services.location_service import soft_delete_location
+    from inventra_backend.services.store_service import soft_delete_store
+    model, delete = (Location, soft_delete_location) if kind == "locations" else (Store, soft_delete_store)
+    row = model(id=test_uuid(kind), name="Keller", normalized_name="keller")
+    db_session.add(row)
+    db_session.flush()
+    delete(db_session, ChangeSet(db_session), test_uuid("first-delete"), row.id, row.version)
+    before = (row.normalized_name, row.version, row.deleted_at)
+    with pytest.raises(DuplicateEntityError):
+        delete(db_session, ChangeSet(db_session), test_uuid("second-delete"), row.id, row.version)
+    assert (row.normalized_name, row.version, row.deleted_at) == before

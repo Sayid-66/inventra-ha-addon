@@ -134,5 +134,5 @@ def delete_product_route(
     with change_set(db) as cs:
         result = soft_delete_product(db, cs, body.operation_id, product_id, body.version)
     # Defer the nested session until the request commits, avoiding a self-deadlock on BEGIN IMMEDIATE.
-    background_tasks.add_task(bring_service.on_product_deleted_sync, product_id)
+    background_tasks.add_task(bring_service.on_product_deleted_with_cleanup, product_id)
     return result

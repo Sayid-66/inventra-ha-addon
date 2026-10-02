@@ -33,11 +33,6 @@ def create_location(
         if existing is not None:
             raise DuplicateEntityError("Location", "normalizedName", normalized)
 
-        # The existing global unique constraint also reserves tombstone names.
-        if db.execute(select(Location.id).where(
-            Location.normalized_name == normalized, Location.deleted_at.is_not(None)
-        ).limit(1)).first() is not None:
-            raise DuplicateEntityError("Location", "normalizedName (reserved by deleted row)", normalized)
         location = Location(id=id, name=name, normalized_name=normalized, version=1)
         db.add(location)
         db.flush()
@@ -65,11 +60,6 @@ def update_location(
         if clash is not None:
             raise DuplicateEntityError("Location", "normalizedName", normalized)
 
-        # Renames are subject to the same global constraint as creates.
-        if db.execute(select(Location.id).where(
-            Location.normalized_name == normalized, Location.deleted_at.is_not(None)
-        ).limit(1)).first() is not None:
-            raise DuplicateEntityError("Location", "normalizedName (reserved by deleted row)", normalized)
         location.name = name
         location.normalized_name = normalized
         location.version += 1
@@ -88,7 +78,7 @@ def soft_delete_location(db: Session, cs: ChangeSet, operation_id: str, id: str,
         from datetime import datetime
 
         location = db.get(Location, id)
-        if location is None:
+        if location is None or location.deleted_at is not None:
             raise DuplicateEntityError("Location", "id", id)
         if location.version != version:
             raise StaleVersionError("Location", id, _to_dict(location))
@@ -107,6 +97,7 @@ def soft_delete_location(db: Session, cs: ChangeSet, operation_id: str, id: str,
 
         location.version += 1
         location.deleted_at = datetime.utcnow()
+        location.normalized_name = f"~deleted~{id}~{location.normalized_name[:150]}"
         db.flush()
         result = _to_dict(location)
         cs.record("Location", id, ChangeKind.DELETE, result)

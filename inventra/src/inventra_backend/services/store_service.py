@@ -26,11 +26,6 @@ def create_store(db: Session, cs: ChangeSet, operation_id: str, id: str, name: s
         normalized = normalize_name(name)
         if db.execute(select(Store).where(Store.normalized_name == normalized, Store.deleted_at.is_(None))).scalar_one_or_none():
             raise DuplicateEntityError("Store", "normalizedName", normalized)
-        # The existing global unique constraint also reserves tombstone names.
-        if db.execute(select(Store.id).where(
-            Store.normalized_name == normalized, Store.deleted_at.is_not(None)
-        ).limit(1)).first() is not None:
-            raise DuplicateEntityError("Store", "normalizedName (reserved by deleted row)", normalized)
         store = Store(id=id, name=name, normalized_name=normalized, version=1)
         db.add(store)
         db.flush()
@@ -53,11 +48,6 @@ def update_store(db: Session, cs: ChangeSet, operation_id: str, id: str, name: s
             select(Store).where(Store.normalized_name == normalized, Store.id != id, Store.deleted_at.is_(None))
         ).scalar_one_or_none():
             raise DuplicateEntityError("Store", "normalizedName", normalized)
-        # Renames are subject to the same global constraint as creates.
-        if db.execute(select(Store.id).where(
-            Store.normalized_name == normalized, Store.deleted_at.is_not(None)
-        ).limit(1)).first() is not None:
-            raise DuplicateEntityError("Store", "normalizedName (reserved by deleted row)", normalized)
         store.name = name
         store.normalized_name = normalized
         store.version += 1
@@ -72,7 +62,7 @@ def update_store(db: Session, cs: ChangeSet, operation_id: str, id: str, name: s
 def soft_delete_store(db: Session, cs: ChangeSet, operation_id: str, id: str, version: int) -> dict:
     def perform() -> dict:
         store = db.get(Store, id)
-        if store is None:
+        if store is None or store.deleted_at is not None:
             raise DuplicateEntityError("Store", "id", id)
         if store.version != version:
             raise StaleVersionError("Store", id, _to_dict(store))
@@ -81,6 +71,7 @@ def soft_delete_store(db: Session, cs: ChangeSet, operation_id: str, id: str, ve
 
         store.version += 1
         store.deleted_at = datetime.utcnow()
+        store.normalized_name = f"~deleted~{id}~{store.normalized_name[:150]}"
         db.flush()
         result = _to_dict(store)
         cs.record("Store", id, ChangeKind.DELETE, result)

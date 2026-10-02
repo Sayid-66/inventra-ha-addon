@@ -611,3 +611,299 @@ async def test_reconcile_reuses_summary(db_session, monkeypatch):
     await reconcile_once(db_session, client)
     assert client.added == ["Wasser"]
     assert db_session.get(BringWatchState, "p1").state == BringWatchStateEnum.ON_LIST_CONFIRMED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("origin,state,status,failure,expected", [
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ON_LIST_CONFIRMED, "needs_action", None, True),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.PENDING_ADD, "needs_action", None, True),
+    (BringWatchOrigin.ADOPTED_EXISTING, BringWatchStateEnum.ON_LIST_CONFIRMED, "needs_action", None, False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.LOCKED_PURCHASED, "needs_action", None, False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ERROR, "needs_action", None, False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ON_LIST_CONFIRMED, "completed", None, False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ON_LIST_CONFIRMED, "missing", None, False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ON_LIST_CONFIRMED, "needs_action", "fetch", False),
+    (BringWatchOrigin.INVENTRA_CREATED, BringWatchStateEnum.ON_LIST_CONFIRMED, "needs_action", "remove", False),
+])
+async def test_product_deletion_external_cleanup(db_session, monkeypatch, origin, state, status, failure, expected):
+    from inventra_backend.services import bring_service
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+
+    db_session.add(Product(id="cleanup", name="Milk", deleted_at=datetime.utcnow()))
+    db_session.flush()
+    db_session.add(BringWatchState(
+        product_id="cleanup", origin=origin, state=state, bring_item_name=" MILK  ",
+        bring_uid=None if state == BringWatchStateEnum.PENDING_ADD else "milk-uid",
+        retry_count=0, created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+    ))
+    db_session.commit()
+
+    class Client(_FakeClient):
+        async def get_items(self):
+            if failure == "fetch":
+                raise HomeAssistantApiError("unavailable")
+            return await super().get_items()
+
+        async def remove_item(self, uid):
+            if failure == "remove":
+                raise HomeAssistantApiError("unavailable")
+            await super().remove_item(uid)
+            self.items[:] = [item for item in self.items if item["uid"] != uid]
+
+    client = Client([] if status == "missing" else [{"summary": "milk", "uid": "milk-uid", "status": status}])
+    monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
+    await bring_service.on_product_deleted_with_cleanup("cleanup")
+    db_session.expire_all()
+    assert db_session.get(BringWatchState, "cleanup") is None
+    assert client.removed == (["milk-uid"] if expected else [])
+    assert client.items == ([] if expected or status == "missing" else [{"summary": "milk", "uid": "milk-uid", "status": status}])
+
+
+@pytest.mark.anyio
+async def test_product_deletion_without_watch_does_not_construct_client(db_session, monkeypatch):
+    from inventra_backend.services import bring_service
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+    def unexpected(**kwargs):
+        pytest.fail("No watch means no HA call")
+    monkeypatch.setattr(bring_service, "BringHaClient", unexpected)
+    await bring_service.on_product_deleted_with_cleanup("absent")
+
+
+
+def _cleanup_watch(product_id, state=BringWatchStateEnum.PENDING_ADD, uid=None,
+                   origin=BringWatchOrigin.INVENTRA_CREATED):
+    return BringWatchState(
+        product_id=product_id, state=state, origin=origin, bring_item_name="Milch",
+        bring_uid=uid, retry_count=0, created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", [BringWatchStateEnum.PENDING_ADD, BringWatchStateEnum.ON_LIST_CONFIRMED])
+async def test_cleanup_and_confirmation_exclude_foreign_uid(db_session, monkeypatch, state):
+    from inventra_backend.services import bring_service
+    db_session.add_all([Product(id="a", name="Milch"), Product(id="b", name="Milch")])
+    db_session.flush()
+    owner = _cleanup_watch("a", BringWatchStateEnum.ON_LIST_CONFIRMED, "u1", BringWatchOrigin.ADOPTED_EXISTING)
+    pending = _cleanup_watch("b")
+    db_session.add_all([owner, pending])
+    db_session.commit()
+    client = _FakeClient([{"summary": "Milch", "uid": "u1", "status": "needs_action"}])
+    advance_pending_add(pending, client.items)
+    assert pending.bring_uid is None
+    assert pending.state == BringWatchStateEnum.PENDING_ADD
+    pending.state = state
+    pending.bring_uid = "u1" if state == BringWatchStateEnum.ON_LIST_CONFIRMED else None
+    db_session.commit()
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+    monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
+    await bring_service.on_product_deleted_with_cleanup("b")
+    db_session.expire_all()
+    assert db_session.get(BringWatchState, "b") is None
+    assert db_session.get(BringWatchState, "a").bring_uid == "u1"
+    assert client.removed == []
+
+
+@pytest.mark.anyio
+async def test_cleanup_waits_for_reconcile_lock(db_session, monkeypatch):
+    import asyncio
+    from inventra_backend.services import bring_service
+    db_session.add(Product(id="b", name="Milch", min_stock=0))
+    db_session.flush()
+    db_session.add(_cleanup_watch("b"))
+    db_session.commit()
+    entered, release, cleanup_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    class ReconcileClient(_FakeClient):
+        async def get_items(self):
+            entered.set()
+            await asyncio.wait_for(release.wait(), 2)
+            return self.items
+    class CleanupClient(_FakeClient):
+        async def get_items(self):
+            cleanup_entered.set()
+            return self.items
+    client = CleanupClient([{"summary": "Milch", "uid": "u1", "status": "needs_action"}])
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+    monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
+    reconcile = asyncio.create_task(reconcile_once(db_session, ReconcileClient([])))
+    cleanup = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        cleanup = asyncio.create_task(bring_service.on_product_deleted_with_cleanup("b"))
+        await asyncio.sleep(0.02)
+        assert not cleanup.done()
+        assert not cleanup_entered.is_set()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(reconcile, cleanup), 2)
+        assert cleanup_entered.is_set()
+        db_session.expire_all()
+        assert db_session.get(BringWatchState, "b") is None
+    finally:
+        release.set()
+        for task in (reconcile, cleanup):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (reconcile, cleanup) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("missing", [False, True])
+async def test_reconcile_sweeps_orphan_watch_with_empty_list(db_session, missing):
+    if not missing:
+        db_session.add(Product(id="orphan", name="Milch", deleted_at=datetime.utcnow()))
+        db_session.flush()
+    db_session.add(_cleanup_watch("orphan"))
+    db_session.commit()
+    client = _FakeClient([])
+    await reconcile_once(db_session, client)
+    assert db_session.get(BringWatchState, "orphan") is None
+    assert client.added == client.removed == []
+
+
+@pytest.mark.anyio
+async def test_reconcile_refreshes_product_deleted_after_summaries(db_session, monkeypatch):
+    from sqlalchemy.orm import Session
+    from inventra_backend.services import bring_service
+    first = Product(id="first", name="Wasser", min_stock=2)
+    victim = Product(id="victim", name="Milch", min_stock=2)
+    db_session.add_all([first, victim])
+    db_session.commit()
+    original = bring_service.build_summaries
+    def summaries(db):
+        rows = original(db)
+        # Ensure victim remains cached with its pre-delete state.
+        db.refresh(victim)
+        return sorted(rows, key=lambda row: row["productId"])
+    monkeypatch.setattr(bring_service, "build_summaries", summaries)
+    original_evaluate = bring_service.evaluate_product
+    class HookClient(_FakeClient):
+        async def get_items(self):
+            # Release BEGIN IMMEDIATE while preserving the stale identity map.
+            expire = db_session.expire_on_commit
+            db_session.expire_on_commit = False
+            try:
+                db_session.commit()
+            finally:
+                db_session.expire_on_commit = expire
+            assert victim.deleted_at is None
+            with Session(db_session.get_bind()) as second:
+                second.get(Product, "victim").deleted_at = datetime.utcnow()
+                second.commit()
+            return await super().get_items()
+    hook = HookClient([])
+    async def evaluate(db, client, product_id, summary=None):
+        if product_id == "first":
+            await hook.get_items()
+        await original_evaluate(db, client, product_id, summary)
+    monkeypatch.setattr(bring_service, "evaluate_product", evaluate)
+    client = _FakeClient([])
+    await reconcile_once(db_session, client)
+    assert client.added == ["Wasser"]
+    assert db_session.get(BringWatchState, "victim") is None
+
+
+
+@pytest.mark.anyio
+async def test_cleanup_closes_sessions_during_ha_and_logs_delete_failure(db_session, monkeypatch, caplog):
+    from contextlib import contextmanager
+    from sqlalchemy.orm import Session
+    from inventra_backend.services import bring_service
+    db_session.add(Product(id="cleanup-sessions", name="Milch"))
+    db_session.flush()
+    db_session.add(_cleanup_watch("cleanup-sessions"))
+    db_session.commit()
+    active = []
+    @contextmanager
+    def tracked_session(engine):
+        with Session(engine) as session:
+            active.append(session)
+            try:
+                yield session
+            finally:
+                active.remove(session)
+    class Client(_FakeClient):
+        async def get_items(self):
+            assert not active
+            return await super().get_items()
+        async def remove_item(self, uid):
+            assert not active
+            await super().remove_item(uid)
+    client = Client([{"summary": "Milch", "uid": "u1", "status": "needs_action"}])
+    monkeypatch.setattr(bring_service, "Session", tracked_session)
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+    monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
+    def fail_delete(db, product_id):
+        assert len(active) == 1
+        raise RuntimeError("delete failed")
+    monkeypatch.setattr(bring_service, "on_product_deleted", fail_delete)
+    await bring_service.on_product_deleted_with_cleanup("cleanup-sessions")
+    assert client.removed == ["u1"]
+    assert "bring watch deletion failed" in caplog.text
+    assert not active
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["sweep", "scheduled"])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("state,origin,status,claimed,failure,removed", [
+    (BringWatchStateEnum.PENDING_ADD, BringWatchOrigin.INVENTRA_CREATED, "needs_action", False, False, True),
+    (BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchOrigin.INVENTRA_CREATED, "needs_action", False, False, True),
+    (BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchOrigin.ADOPTED_EXISTING, "needs_action", False, False, False),
+    (BringWatchStateEnum.LOCKED_PURCHASED, BringWatchOrigin.INVENTRA_CREATED, "needs_action", False, False, False),
+    (BringWatchStateEnum.ERROR, BringWatchOrigin.INVENTRA_CREATED, "needs_action", False, False, False),
+    (BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchOrigin.INVENTRA_CREATED, "completed", False, False, False),
+    (BringWatchStateEnum.PENDING_ADD, BringWatchOrigin.INVENTRA_CREATED, "needs_action", True, False, False),
+    (BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchOrigin.INVENTRA_CREATED, "needs_action", True, False, False),
+    (BringWatchStateEnum.ON_LIST_CONFIRMED, BringWatchOrigin.INVENTRA_CREATED, "needs_action", False, True, False),
+])
+async def test_deleted_product_paths_cleanup_before_row_deletion(
+    db_session, monkeypatch, path, missing, state, origin, status, claimed, failure, removed,
+):
+    from inventra_backend.services import bring_service
+    if not missing:
+        db_session.add(Product(id="orphan", name="Milch", deleted_at=datetime.utcnow()))
+        db_session.flush()
+    db_session.add(_cleanup_watch("orphan", state, None if state == BringWatchStateEnum.PENDING_ADD else "u1", origin))
+    if claimed:
+        db_session.add(Product(id="owner", name="Milk", min_stock=0))
+        db_session.flush()
+        db_session.add(_cleanup_watch("owner", BringWatchStateEnum.ON_LIST_CONFIRMED, "u1", BringWatchOrigin.ADOPTED_EXISTING))
+    db_session.commit()
+
+    class Client(_FakeClient):
+        async def remove_item(self, uid):
+            if failure:
+                raise HomeAssistantApiError("remove failed")
+            await super().remove_item(uid)
+            self.items[:] = [item for item in self.items if item["uid"] != uid]
+
+    item = {"summary": "  MILCH  ", "uid": "u1", "status": status}
+    client = Client([item])
+    monkeypatch.setattr(bring_service, "get_engine", lambda: db_session.get_bind())
+    monkeypatch.setattr(bring_service, "BringHaClient", lambda **kwargs: client)
+    if path == "sweep":
+        await reconcile_once(db_session, client)
+        # The delayed deletion callback must remain safe after the sweep.
+        await bring_service.on_product_deleted_with_cleanup("orphan")
+    else:
+        await bring_service.schedule_stock_change("orphan", increased=False)
+    db_session.expire_all()
+    assert db_session.get(BringWatchState, "orphan") is None
+    assert client.removed == (["u1"] if removed else [])
+    assert client.items == ([] if removed else [item])
+    if claimed:
+        assert db_session.get(BringWatchState, "owner").bring_uid == "u1"
+
+
+@pytest.mark.anyio
+async def test_sweep_does_not_adopt_removed_item_from_snapshot(db_session):
+    db_session.add_all([Product(id="orphan", name="Milch", deleted_at=datetime.utcnow()),
+                        Product(id="replacement", name="Milch", min_stock=2)])
+    db_session.flush()
+    db_session.add(_cleanup_watch("orphan", BringWatchStateEnum.ON_LIST_CONFIRMED, "u1"))
+    db_session.commit()
+    client = _FakeClient([{"summary": "Milch", "uid": "u1", "status": "needs_action"}])
+    await reconcile_once(db_session, client)
+    assert client.removed == ["u1"]
+    assert client.added == ["Milch"]
+    assert db_session.get(BringWatchState, "replacement").state == BringWatchStateEnum.PENDING_ADD
