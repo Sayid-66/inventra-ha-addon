@@ -214,7 +214,9 @@ def test_purchase_new_product_with_matching_resolution_credits_resolver_provenan
     client, device = api_client_with_device
     resolution_id = _resolve_name(client, device, monkeypatch, "Milch")
 
-    product = _purchase_new_product(client, device, "Milch", resolution_id)
+    product = _purchase_new_product(client, device, "Milch 1 l", resolution_id)
+
+    assert product["name"] == "Milch 1 l"
 
     assert product["fieldProvenance"]["name"]["manual"] is False
     assert product["fieldProvenance"]["name"]["selectedSource"] == "off"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,10 @@ from ..services.product_service import get_product
 from ..services.unit_normalizer import quantity_diff
 from .cache import get_fresh_cache_entries, upsert_cache_entries
 from .resolution_store import create_resolution
-from .scoring import FieldMergeResult, merge_text_field, merge_quantity_field
+from .product_naming import compose_product_name, format_size
+from .quantity import parse_quantity
+from .plausibility import is_plausible_text
+from .scoring import Confidence, FieldMergeResult, merge_text_field, merge_quantity_field
 from .single_flight import SingleFlight
 from .source_client import SourceResult
 from .name_normalizer import normalize_product_name, normalize_category, clean_source_text
@@ -61,14 +64,38 @@ def _merge_all_fields(results: dict[str, SourceResult]) -> dict[str, FieldMergeR
                    "brand": clean_source_text, "variant": clean_source_text}.get(attr, lambda value: value)
         return {s: cleaner(r.candidate.__dict__.get(attr) if r.candidate else None) for s, r in results.items()}
 
-    return {
-        "name": merge_text_field("name", text_by_source("name")),
+    quantity = merge_quantity_field(text_by_source("quantity_text"))
+    parsed = parse_quantity(quantity.value) if quantity.confidence in (Confidence.HIGH, Confidence.MEDIUM) else None
+    size = format_size(parsed.amount, parsed.unit, parsed.pack_count) if parsed else None
+    merged = {
+        "name": merge_text_field("name", {
+            source: compose_product_name(
+                result.candidate.name,
+                result.candidate.brands or ((result.candidate.brand,) if result.candidate.brand else ()),
+                size,
+            ) if result.candidate else None
+            for source, result in results.items()
+        }),
         "brand": merge_text_field("brand", text_by_source("brand")),
-        "quantity": merge_quantity_field(text_by_source("quantity_text")),
+        "quantity": quantity,
         "imageUrl": merge_text_field("url", text_by_source("image_url")),
         "category": merge_text_field("generic", text_by_source("category")),
         "variant": merge_text_field("generic", text_by_source("variant")),
     }
+
+    category = merged["category"]
+    category_ok = (category.confidence in (Confidence.HIGH, Confidence.MEDIUM)
+                   and category.value is not None and is_plausible_text(category.value))
+    name = merged["name"]
+    composed = compose_product_name(name.value, (), size, category.value, category_ok)
+    if name.value is None and name.suggested is not None:
+        merged["name"] = replace(name, suggested=compose_product_name(name.suggested, (), size))
+    elif composed is not None:
+        merged["name"] = (FieldMergeResult(composed, None, Confidence.MEDIUM,
+            category.selected_source, category.contributing_sources, category.conflicting_sources)
+            if name.value is None else replace(name, value=composed))
+    return merged
+
 
 
 def _field_result_to_dict(result: FieldMergeResult) -> dict:

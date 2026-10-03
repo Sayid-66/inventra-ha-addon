@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
@@ -31,7 +31,10 @@ def get_fresh_cache_entries(db: Session, barcode: str) -> dict[str, SourceResult
     for row in rows:
         candidate = None
         if row.candidate_json:
-            candidate = SourceCandidate(**json.loads(row.candidate_json))
+            data = json.loads(row.candidate_json)
+            data = {k: v for k, v in data.items() if k in {f.name for f in fields(SourceCandidate)}}
+            data["brands"] = tuple(data.get("brands") or ())
+            candidate = SourceCandidate(**data)
         out[row.source] = SourceResult(source=row.source, status=row.status, candidate=candidate)
     return out
 

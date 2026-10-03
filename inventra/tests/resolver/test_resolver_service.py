@@ -80,7 +80,7 @@ async def test_unknown_barcode_fans_out_to_all_four_sources_and_merges(monkeypat
     result = await resolver_service.resolve("9999999999999")
     assert result.matched_locally is False
     assert result.resolution_id is not None
-    assert result.fields["name"].value == "Produkt X"
+    assert result.fields["name"].value == "Produkt X 500 ml"
     assert result.fields["name"].confidence.value == "high"  # off+opf agree
 
 
@@ -221,3 +221,21 @@ async def test_re_resolve_quantity_display_and_comparison(monkeypatch, manual, p
     assert result.diff["quantity"]["changed"] is changed
     assert result.diff["quantity"]["manual"] is manual
     assert result.diff["quantity"]["proposedValue"] == (None if manual else proposed)
+
+
+
+def test_naming_preserves_size_without_plausible_quantity():
+    from inventra_backend.resolver.resolver_service import _merge_all_fields
+    from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
+    for quantity in (None, "unknown"):
+        fields = _merge_all_fields({"off": SourceResult("off", "FOUND",
+            SourceCandidate("Milch 1 l", None, quantity, None, None, None))})
+        assert fields["name"].value == "Milch 1 l"
+
+
+def test_naming_multipack_uses_canonical_count_unit():
+    from inventra_backend.resolver.resolver_service import _merge_all_fields
+    from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
+    fields = _merge_all_fields({"off": SourceResult("off", "FOUND",
+        SourceCandidate("Produkt", None, "6 x 2 stk", None, None, None))})
+    assert fields["name"].value == "Produkt 6 x 2 Stk."

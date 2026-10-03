@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import httpx
 
 from ..services.unit_normalizer import normalize_quantity
+from .product_naming import split_brands
 from .name_normalizer import normalize_product_name, normalize_category
 
 
@@ -16,6 +17,7 @@ class SourceCandidate:
     image_url: str | None
     category: str | None
     variant: str | None
+    brands: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,5 +95,6 @@ class OpenFactsClient:
             image_url=product.get("image_url"),
             category=normalize_category((product.get("categories") or "").split(",")[0]),
             variant=None,
+            brands=tuple(split_brands(product.get("brands"))),
         )
         return SourceResult(source=self._source_id, status="FOUND", candidate=candidate)
