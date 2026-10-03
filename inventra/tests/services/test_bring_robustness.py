@@ -36,13 +36,17 @@ class Client:
         self.write('get')
         return list(self.items)
 
-    async def add_item(self, name):
+    async def add_item(self, name, description=None):
         self.write('add')
         self.added.append(name)
         if self.add_failures:
             self.add_failures -= 1
             raise HomeAssistantApiError('token=secret')
-        self.items.append(dict(uid='u', summary=name, status='needs_action'))
+        self.items.append(dict(uid='u', summary=name, status='needs_action', description=description))
+
+    async def update_item(self, uid, description):
+        self.write('update')
+        next(item for item in self.items if item['uid'] == uid)['description'] = description
 
     async def remove_item(self, uid):
         self.write('remove')
@@ -172,7 +176,7 @@ async def test_stale_add_outcome_is_not_applied(db_session, monkeypatch, change)
     setup(db_session, monkeypatch)
     client = Client(db_session.get_bind(), add_failures=1)
     original_add = client.add_item
-    async def changed_add(name):
+    async def changed_add(name, description=None):
         with Session(db_session.get_bind()) as db:
             if change == 'delete':
                 db.get(Product, 'p').deleted_at = datetime.utcnow()
@@ -188,7 +192,7 @@ async def test_stale_add_outcome_is_not_applied(db_session, monkeypatch, change)
                 watch.updated_at = datetime.utcnow()
                 watch.last_error = 'manual'
             db.commit()
-        await original_add(name)
+        await original_add(name, description)
     client.add_item = changed_add
     await asyncio.wait_for(bring.reconcile_once(db_session, client), 2)
     watch = row(db_session)
@@ -281,10 +285,10 @@ async def test_product_failure_does_not_abort_cycle(db_session, monkeypatch, orp
     db_session.add(Product(id='next', name='Next', min_stock=2))
     db_session.commit()
     class BrokenClient(Client):
-        async def add_item(self, name):
+        async def add_item(self, name, description=None):
             if name == 'Water':
                 raise ValueError('bad product')
-            await super().add_item(name)
+            await super().add_item(name, description)
         async def remove_item(self, uid):
             raise ValueError('bad orphan')
     client = BrokenClient(db_session.get_bind(),

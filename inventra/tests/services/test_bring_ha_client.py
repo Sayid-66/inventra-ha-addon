@@ -81,3 +81,32 @@ async def test_add_item_raises_homeassistant_api_error_on_connection_failure():
     client = _client(handler)
     with pytest.raises(HomeAssistantApiError):
         await client.add_item("Wasser")
+
+
+@pytest.mark.anyio
+async def test_quantity_payloads_and_update_errors():
+    import json
+    calls = []
+    def handler(request):
+        calls.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
+        return httpx.Response(200, json={})
+    client = _client(handler)
+    await client.add_item("Water")
+    await client.add_item("Water", "2 Stk.")
+    await client.update_item("uid", "3 Stk.")
+    assert calls == [
+        ("add_item", {"entity_id": "todo.zuhause", "item": "Water"}),
+        ("add_item", {"entity_id": "todo.zuhause", "item": "Water", "description": "2 Stk."}),
+        ("update_item", {"entity_id": "todo.zuhause", "item": "uid", "description": "3 Stk."}),
+    ]
+    client = _client(lambda request: httpx.Response(503))
+    with pytest.raises(HomeAssistantApiError):
+        await client.update_item("uid", "3 Stk.")
+
+
+@pytest.mark.anyio
+async def test_update_item_wraps_connection_errors():
+    def handler(request):
+        raise httpx.ConnectError("unavailable", request=request)
+    with pytest.raises(HomeAssistantApiError):
+        await _client(handler).update_item("Water", "1 Stk.")

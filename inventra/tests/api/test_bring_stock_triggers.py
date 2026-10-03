@@ -151,3 +151,34 @@ def test_product_delete_retains_watch_until_failed_removal_recovers(api_client_w
     assert ha.items == []
     with Session(engine) as db:
         assert db.get(BringWatchState, product_id) is None
+
+
+
+def test_min_stock_patch_updates_bring_quantity(api_client_with_device, monkeypatch):
+    from sqlalchemy.orm import Session
+    from inventra_backend.db.base import get_engine
+    from inventra_backend.db.models import BringWatchState
+    from inventra_backend.services import bring_service as bring
+    client, device = api_client_with_device
+    product_id = test_uuid("quantity-patch")
+    headers = _headers(device)
+    response = client.post("/api/v1/products", json={"operationId": test_uuid("quantity-create"),
+                           "id": product_id, "name": "Water", "minStock": 2}, headers=headers)
+    assert response.status_code == 201
+    with Session(get_engine()) as db:
+        db.add(BringWatchState(product_id=product_id, state="ON_LIST_CONFIRMED",
+                              origin="INVENTRA_CREATED", bring_uid="water",
+                              bring_item_name="Water", retry_count=0))
+        db.commit()
+    updates = []
+    class HaClient:
+        async def get_items(self):
+            return [dict(uid="water", summary="Water", status="needs_action", description="2 Stk.")]
+        async def update_item(self, uid, description):
+            updates.append((uid, description))
+    monkeypatch.setattr(bring, "_client", lambda: HaClient())
+    response = client.patch(f"/api/v1/products/{product_id}",
+                            json={"operationId": test_uuid("quantity-patch-op"),
+                                  "version": 1, "minStock": 5}, headers=headers)
+    assert response.status_code == 200
+    assert updates == [("water", "5 Stk.")]

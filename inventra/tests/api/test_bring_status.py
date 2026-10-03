@@ -95,13 +95,13 @@ def test_retry_recovers_after_repeated_ha_add_failures(api_client_with_device, m
                 db.get(Product, product_id).name = 'Water'
                 db.commit()
             return list(self.items)
-        async def add_item(self, name):
+        async def add_item(self, name, description=None):
             with Session(engine) as db:
                 db.get(Product, product_id).name = 'Water'
                 db.commit()
             if self.failing:
                 raise HomeAssistantApiError('secret')
-            self.items.append(dict(uid='water', summary=name, status='needs_action'))
+            self.items.append(dict(uid='water', summary=name, status='needs_action', description=description))
     ha = HaClient()
     monkeypatch.setattr(bring, 'BringHaClient', lambda **kwargs: ha)
     async def cycle():

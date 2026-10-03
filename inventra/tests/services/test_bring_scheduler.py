@@ -44,7 +44,7 @@ async def test_concurrent_stock_changes_complete_without_overlapping_transaction
             fetches.append(True)
             return []
 
-        async def add_item(self, name):
+        async def add_item(self, name, description=None):
             added.append(name)
             if name == "Water":
                 first_adding.set()

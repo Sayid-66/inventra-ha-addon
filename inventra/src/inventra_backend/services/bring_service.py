@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 import logging
+from math import ceil
 import os
 import re
 from typing import Optional
@@ -55,6 +56,14 @@ def _find_by_uid(items: list[dict], uid: str) -> Optional[dict]:
         if item["uid"] == uid:
             return item
     return None
+
+
+def bring_quantity(product: Product, stock_packs: float) -> int:
+    return max(1, ceil((product.min_stock or 0) - stock_packs))
+
+
+def bring_description(product: Product, stock_packs: float) -> str:
+    return f"{bring_quantity(product, stock_packs)} Stk."
 
 
 def build_display_name(name: str, brand: str | None, variant: str | None, quantity: float | None = None, unit_abbreviation: str | None = None) -> str:
@@ -193,6 +202,7 @@ def _plan(db, product_id, summary=None, force_add=False, reconcile=False):
     name = None
     conflict = None
     candidates = []
+    description = None
     if product is None or product.deleted_at is not None:
         action = 'remove' if watch is not None else 'none'
     elif not force_add and product.min_stock in (None, 0):
@@ -200,6 +210,10 @@ def _plan(db, product_id, summary=None, force_add=False, reconcile=False):
                   ('advance' if reconcile else 'clear')) if watch is not None else 'none'
     else:
         current = summary if summary is not None else marker[-1]
+        if current is not None:
+            description = bring_description(product, stock_packs(product, current))
+        elif force_add:
+            description = bring_description(product, 0)
         if not force_add and current is not None and stock_packs(product, current) >= product.min_stock:
             if watch is not None and watch.state in (
                 BringWatchStateEnum.PENDING_ADD, BringWatchStateEnum.ON_LIST_CONFIRMED,
@@ -220,7 +234,8 @@ def _plan(db, product_id, summary=None, force_add=False, reconcile=False):
     return SimpleNamespace(product_id=product_id, product_marker=marker,
                            watch_marker=_watch_marker(watch), fields=fields,
                            claimed=_claimed_by_others(db, product_id), action=action,
-                           name=name, candidates=candidates, conflict=conflict)
+                           name=name, candidates=candidates, conflict=conflict,
+                           description=description)
 
 
 def _matches(db, plan):
@@ -280,7 +295,35 @@ def _needs_items(plan):
         return (plan.fields.origin == BringWatchOrigin.INVENTRA_CREATED
                 and plan.fields.state in (BringWatchStateEnum.PENDING_ADD,
                                           BringWatchStateEnum.ON_LIST_CONFIRMED))
+    if plan.action == 'advance':
+        return (plan.description is not None
+                and plan.fields.origin == BringWatchOrigin.INVENTRA_CREATED
+                and (plan.fields.state == BringWatchStateEnum.PENDING_ADD
+                     or (plan.fields.state == BringWatchStateEnum.ON_LIST_CONFIRMED
+                         and plan.fields.bring_uid is not None)))
     return False
+
+
+async def _sync_quantity(client, plan, items):
+    if not _needs_items(plan):
+        return
+    actionable = [item for item in items if item['status'] == 'needs_action'
+                  and item['uid'] not in plan.claimed]
+    if plan.fields.state == BringWatchStateEnum.PENDING_ADD:
+        if _find_by_name([item for item in items if item['status'] == 'completed'],
+                         plan.fields.bring_item_name) is not None:
+            return
+        match = _find_by_name(actionable, plan.fields.bring_item_name)
+    else:
+        match = _find_by_uid(actionable, plan.fields.bring_uid)
+    if match is None or match.get('description') == plan.description:
+        return
+    try:
+        await client.update_item(match['uid'], plan.description)
+    except HomeAssistantApiError:
+        logger.warning('bring quantity update failed for product %s', plan.product_id)
+    else:
+        match['description'] = plan.description
 
 
 async def _execute_plan(engine, client, plan, items, advance):
@@ -324,7 +367,7 @@ async def _execute_plan(engine, client, plan, items, advance):
             return
         failed = False
         try:
-            await client.add_item(plan.name)
+            await client.add_item(plan.name, plan.description)
         except HomeAssistantApiError:
             failed = True
         if failed:
@@ -349,6 +392,7 @@ async def _execute_plan(engine, client, plan, items, advance):
                 on_product_deleted(db, plan.product_id)
                 db.commit()
         return
+    await _sync_quantity(client, plan, items)
     if not advance:
         return
     failed = False
@@ -371,7 +415,7 @@ async def _execute_plan(engine, client, plan, items, advance):
             return
         if visible is None or plan.fields.last_error == 'ADD_FAILED':
             try:
-                await client.add_item(plan.fields.bring_item_name)
+                await client.add_item(plan.fields.bring_item_name, plan.description)
             except HomeAssistantApiError:
                 failed = True
     with Session(engine) as db:

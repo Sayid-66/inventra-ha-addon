@@ -20,9 +20,12 @@ class _FakeClient:
     async def get_items(self):
         return self.items
 
-    async def add_item(self, name):
+    async def add_item(self, name, description=None):
         self.added.append(name)
-        self.items.append({"summary": name, "uid": f"uid-{name}", "status": "needs_action"})
+        self.items.append({"summary": name, "uid": f"uid-{name}", "status": "needs_action", "description": description})
+
+    async def update_item(self, uid, description):
+        next(item for item in self.items if item["uid"] == uid)["description"] = description
 
     async def remove_item(self, uid):
         self.removed.append(uid)
@@ -779,12 +782,12 @@ async def test_reconcile_refreshes_product_deleted_after_summaries(db_session, m
                         Product(id="victim", name="Milch", min_stock=2)])
     db_session.commit()
     class HookClient(_FakeClient):
-        async def add_item(self, name):
+        async def add_item(self, name, description=None):
             if name == "Wasser":
                 with Session(db_session.get_bind()) as second:
                     second.get(Product, "victim").deleted_at = datetime.utcnow()
                     second.commit()
-            await super().add_item(name)
+            await super().add_item(name, description)
     client = HookClient([])
     import asyncio
     await asyncio.wait_for(reconcile_once(db_session, client), 2)
@@ -897,3 +900,133 @@ async def test_sweep_does_not_adopt_removed_item_from_snapshot(db_session):
     assert client.removed == ["u1"]
     assert client.added == ["Milch"]
     assert db_session.get(BringWatchState, "replacement").state == BringWatchStateEnum.PENDING_ADD
+
+
+@pytest.mark.parametrize("minimum,stock,expected", [
+    (5, 3, 2), (5, 3.5, 2), (5, 4.9, 1), (5, 0, 5),
+    (1000000, 0.5, 1000000), (5, 5, 1), (5, 6, 1),
+])
+def test_bring_quantity(minimum, stock, expected):
+    from inventra_backend.services.bring_service import bring_quantity, bring_description
+    product = Product(min_stock=minimum)
+    assert bring_quantity(product, stock) == expected
+    assert bring_description(product, stock) == f"{expected} Stk."
+
+
+class _QuantityClient(_FakeClient):
+    def __init__(self, items):
+        super().__init__(items)
+        self.updates = []
+        self.fetches = 0
+        self.fail_update = False
+
+    async def get_items(self):
+        self.fetches += 1
+        return self.items
+
+    async def update_item(self, uid, description):
+        self.updates.append((uid, description))
+        if self.fail_update:
+            raise HomeAssistantApiError("secret must not be logged")
+        await super().update_item(uid, description)
+
+
+def _quantity_setup(db, monkeypatch, state="ON_LIST_CONFIRMED", origin="INVENTRA_CREATED",
+                    status="needs_action", description="2 Stk.", watched=True):
+    from inventra_backend.services import bring_service as bring
+    db.add(Product(id="quantity", name="Water", min_stock=5))
+    if watched:
+        db.add(BringWatchState(product_id="quantity", state=state, origin=origin,
+                              bring_item_name="Water", bring_uid="water" if state != "PENDING_ADD" else None,
+                              retry_count=0))
+    db.commit()
+    stock = [3]
+    monkeypatch.setattr(bring, "stock_packs", lambda product, summary: stock[0])
+    monkeypatch.setattr(bring, "get_engine", lambda: db.get_bind())
+    client = _QuantityClient([dict(uid="water", summary="Water", status=status,
+                                   description=description)] if watched else [])
+    monkeypatch.setattr(bring, "_client", lambda: client)
+    return bring, client, stock
+
+
+@pytest.mark.anyio
+async def test_create_includes_quantity(db_session, monkeypatch):
+    bring, client, stock = _quantity_setup(db_session, monkeypatch, watched=False)
+    await bring.schedule_stock_change("quantity", False)
+    assert client.added == ["Water"]
+    assert client.items[0]["description"] == "2 Stk."
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["PENDING_ADD", "ON_LIST_CONFIRMED"])
+async def test_stock_changes_sync_quantity_then_remove(db_session, monkeypatch, state):
+    bring, client, stock = _quantity_setup(db_session, monkeypatch, state=state)
+    await bring.schedule_stock_change("quantity", False)
+    assert client.fetches == 1
+    assert client.updates == []  # live description already matches
+    stock[0] = 2
+    await bring.schedule_stock_change("quantity", False)
+    assert client.updates == [("water", "3 Stk.")]
+    stock[0] = 3
+    await bring.schedule_stock_change("quantity", True)
+    stock[0] = 4
+    await bring.schedule_stock_change("quantity", True)
+    assert client.updates == [("water", "3 Stk."), ("water", "2 Stk."), ("water", "1 Stk.")]
+    assert client.added == []
+    stock[0] = 5
+    await bring.schedule_stock_change("quantity", True)
+    assert client.removed == ["water"]
+    assert db_session.get(BringWatchState, "quantity") is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state,origin,status", [
+    ("ON_LIST_CONFIRMED", "ADOPTED_EXISTING", "needs_action"),
+    ("ON_LIST_CONFIRMED", "INVENTRA_CREATED", "completed"),
+    ("PENDING_ADD", "INVENTRA_CREATED", "completed"),
+    ("LOCKED_PURCHASED", "INVENTRA_CREATED", "needs_action"),
+    ("ERROR", "INVENTRA_CREATED", "needs_action"),
+])
+async def test_quantity_leaves_protected_items_untouched(db_session, monkeypatch, state, origin, status):
+    bring, client, stock = _quantity_setup(db_session, monkeypatch, state, origin, status)
+    stock[0] = 2
+    await bring.schedule_stock_change("quantity", False)
+    await bring.reconcile_once(db_session, client)
+    assert client.updates == client.added == client.removed == []
+    assert client.items[0]["description"] == "2 Stk."
+    assert client.items[0]["status"] == status
+
+
+@pytest.mark.anyio
+async def test_failed_quantity_update_retries_without_changing_watch(db_session, monkeypatch, caplog):
+    bring, client, stock = _quantity_setup(db_session, monkeypatch)
+    stock[0] = 2
+    watch = db_session.get(BringWatchState, "quantity")
+    before = bring._watch_marker(watch)
+    db_session.commit()
+    client.fail_update = True
+    await bring.schedule_stock_change("quantity", False)
+    db_session.expire_all()
+    assert bring._watch_marker(db_session.get(BringWatchState, "quantity")) == before
+    assert "secret must not be logged" not in caplog.text
+    client.fail_update = False
+    await bring.reconcile_once(db_session, client)
+    assert client.updates == [("water", "3 Stk."), ("water", "3 Stk.")]
+    assert db_session.get(BringWatchState, "quantity").state == "ON_LIST_CONFIRMED"
+    await bring.reconcile_once(db_session, client)
+    assert len(client.updates) == 2
+
+
+@pytest.mark.anyio
+async def test_quantity_fetch_race_preserves_product_marker_guard(db_session, monkeypatch):
+    from sqlalchemy.orm import Session
+    bring, client, stock = _quantity_setup(db_session, monkeypatch)
+    stock[0] = 2
+    async def changed_items():
+        with Session(db_session.get_bind()) as other:
+            other.get(Product, "quantity").min_stock = 7
+            other.commit()
+        return client.items
+    monkeypatch.setattr(client, "get_items", changed_items)
+    await bring.schedule_stock_change("quantity", False)
+    assert client.updates == []

@@ -60,18 +60,36 @@ class BringHaClient:
                 f"unexpected todo.get_items response shape: {body}"
             ) from exc
 
-    async def add_item(self, name: str) -> None:
+    async def add_item(self, name: str, description: str | None = None) -> None:
+        payload = {"entity_id": self._todo_entity_id, "item": name}
+        if description is not None:
+            payload["description"] = description
         async with self._client() as client:
             try:
                 resp = await client.post(
                     f"{self._base_url}/services/todo/add_item",
                     headers={"Authorization": f"Bearer {self._token}"},
-                    json={"entity_id": self._todo_entity_id, "item": name},
+                    json=payload,
                 )
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
                 raise HomeAssistantApiError(
                     f"todo.add_item failed: {exc}"
+                ) from exc
+
+    async def update_item(self, uid_or_name: str, description: str) -> None:
+        async with self._client() as client:
+            try:
+                resp = await client.post(
+                    f"{self._base_url}/services/todo/update_item",
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    json={"entity_id": self._todo_entity_id, "item": uid_or_name,
+                          "description": description},
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise HomeAssistantApiError(
+                    f"todo.update_item failed: {exc}"
                 ) from exc
 
     async def remove_item(self, uid: str) -> None:
