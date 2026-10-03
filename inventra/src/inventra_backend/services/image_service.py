@@ -73,6 +73,27 @@ def _remove_paths(paths) -> None:
             logger.warning("Could not remove obsolete product image")
 
 
+def _obsolete_paths(product_id: str, paths, current_url: str | None):
+    digest = current_url.rsplit("=", 1)[1] if is_uploaded_url(product_id, current_url) else None
+    current_paths = {image_path(product_id, ext, digest) for ext in MEDIA_TYPES} if digest else set()
+    hashed_exists = any(path.is_file() for path in current_paths)
+    legacy_paths = {image_path(product_id, ext) for ext in MEDIA_TYPES}
+    for path in paths:
+        if digest is not None:
+            if path in current_paths:
+                continue
+            if path in legacy_paths and not hashed_exists:
+                try:
+                    if hashlib.sha256(path.read_bytes()).hexdigest()[:12] == digest:
+                        continue
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logger.warning("Could not inspect legacy product image")
+                    continue
+        yield path
+
+
 def remove_images(product_id: str) -> None:
     directory = image_path(product_id, "jpg").parent
     _remove_paths(directory.glob(f"{product_id}.*"))
@@ -85,20 +106,25 @@ def remove_uploaded_url(product_id: str, url: str) -> None:
             product = get_product(db, product_id)
             if product and product.image_url == url and product.deleted_at is None:
                 return
-            _remove_paths(image_path(product_id, ext, digest) for ext in MEDIA_TYPES)
-            _remove_paths(image_path(product_id, ext) for ext in MEDIA_TYPES)
+            paths = [image_path(product_id, ext, digest) for ext in MEDIA_TYPES]
+            paths.extend(image_path(product_id, ext) for ext in MEDIA_TYPES)
+            current_url = product.image_url if product and product.deleted_at is None else None
+            _remove_paths(_obsolete_paths(product_id, paths, current_url))
 
 
 def store_image_transaction(product_id: str, data: bytes, content_type: str) -> dict:
     with session_scope(get_engine()) as db:
+        require_product(db, product_id)  # Acquire the SQLite write lock before observing files.
         old_paths = list(image_path(product_id, "jpg").parent.glob(f"{product_id}.*"))
         result = store_image(db, product_id, data, content_type)
     # Only remove files observed before this upload, after its commit succeeds.
-    with session_scope(get_engine()) as db:
-        product = get_product(db, product_id)
-        current_url = product.image_url if product else None
-        digest = current_url.rsplit("=", 1)[1] if is_uploaded_url(product_id, current_url) else None
-        _remove_paths(path for path in old_paths if digest is None or f".{digest}." not in path.name)
+    try:
+        with session_scope(get_engine()) as db:
+            product = get_product(db, product_id)
+            current_url = product.image_url if product else None
+            _remove_paths(_obsolete_paths(product_id, old_paths, current_url))
+    except Exception as exc:
+        logger.warning("Could not clean up committed product image (%s)", type(exc).__name__)
     return result
 
 

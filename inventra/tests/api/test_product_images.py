@@ -233,3 +233,113 @@ def test_failed_unlink_logs_and_serves_current_format(photo_product, monkeypatch
     fetched = client.get(result.json()["imageUrl"], headers=headers)
     assert fetched.content == png
     assert fetched.headers["content-type"] == "image/png"
+
+
+@pytest.mark.parametrize("failure", ["session-enter", "session-exit", "lookup", "remove"])
+def test_cleanup_failure_does_not_fail_committed_upload(photo_product, monkeypatch, caplog, failure):
+    from contextlib import contextmanager
+    client, headers, pid = photo_product
+    original_scope = image_service.session_scope
+    original_get = image_service.get_product
+    calls = 0
+    cleanup = False
+
+    @contextmanager
+    def scope(engine):
+        nonlocal calls, cleanup
+        calls += 1
+        cleanup = calls == 2
+        if cleanup and failure == "session-enter":
+            raise RuntimeError("private cleanup details")
+        with original_scope(engine) as db:
+            yield db
+            if cleanup and failure == "session-exit":
+                raise RuntimeError("private cleanup details")
+
+    def get(db, product_id):
+        if cleanup and failure == "lookup":
+            raise RuntimeError("private cleanup details")
+        return original_get(db, product_id)
+
+    def remove(paths):
+        raise RuntimeError("private cleanup details")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(image_service, "session_scope", scope)
+        scoped.setattr(image_service, "get_product", get)
+        if failure == "remove":
+            scoped.setattr(image_service, "_remove_paths", remove)
+        response = upload(client, headers, pid)
+    assert response.status_code == 200
+    url = response.json()["imageUrl"]
+    with original_scope(image_service.get_engine()) as db:
+        assert original_get(db, pid).image_url == url
+    assert client.get(url, headers=headers).content == JPEG
+    assert "Could not clean up committed product image (RuntimeError)" in caplog.text
+    assert "private cleanup details" not in caplog.text
+
+
+def test_upload_locks_before_file_snapshot(photo_product, monkeypatch):
+    from pathlib import Path
+    from sqlalchemy import event
+    client, headers, pid = photo_product
+    order = []
+    engine = image_service.get_engine()
+    original_glob = Path.glob
+
+    def sql(conn, cursor, statement, parameters, context, executemany):
+        if statement == "BEGIN IMMEDIATE":
+            order.append("lock")
+        elif statement.lstrip().upper().startswith("SELECT"):
+            order.append("read")
+
+    def glob(path, pattern):
+        if pattern == f"{pid}.*":
+            assert "lock" in order and "read" in order
+            order.append("glob")
+        return original_glob(path, pattern)
+
+    event.listen(engine, "before_cursor_execute", sql)
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, "glob", glob)
+            assert upload(client, headers, pid).status_code == 200
+    finally:
+        event.remove(engine, "before_cursor_execute", sql)
+    assert order.index("lock") < order.index("read") < order.index("glob")
+
+
+@pytest.mark.parametrize("hashed_exists", [False, True])
+def test_cleanup_preserves_needed_legacy_image(photo_product, monkeypatch, hashed_exists):
+    client, headers, pid = photo_product
+    response = upload(client, headers, pid)
+    url = response.json()["imageUrl"]
+    hashed = image_service.image_path(pid, "jpg", url.rsplit("=", 1)[1])
+    legacy = image_service.image_path(pid, "jpg")
+    legacy.write_bytes(JPEG)
+    if not hashed_exists:
+        hashed.unlink()
+    # Keep committed state stable to exercise cleanup with either disk layout.
+    monkeypatch.setattr(image_service, "store_image", lambda *args: response.json())
+    assert upload(client, headers, pid).status_code == 200
+    assert legacy.exists() is (not hashed_exists)
+    assert client.get(url, headers=headers).content == JPEG
+
+
+@pytest.mark.parametrize("hashed_exists", [False, True])
+def test_remove_old_url_preserves_current_legacy_fallback(photo_product, hashed_exists):
+    client, headers, pid = photo_product
+    current_url = upload(client, headers, pid).json()["imageUrl"]
+    hashed = image_service.image_path(pid, "jpg", current_url.rsplit("=", 1)[1])
+    legacy = image_service.image_path(pid, "jpg")
+    legacy.write_bytes(JPEG)
+    if not hashed_exists:
+        hashed.unlink()
+    old_bytes = JPEG + b"obsolete"
+    old_digest = hashlib.sha256(old_bytes).hexdigest()[:12]
+    old_path = image_service.image_path(pid, "jpg", old_digest)
+    old_path.write_bytes(old_bytes)
+    image_service.remove_uploaded_url(pid, f"/api/v1/products/{pid}/image?v={old_digest}")
+    assert not old_path.exists()
+    assert legacy.exists() is (not hashed_exists)
+    assert client.get(current_url, headers=headers).content == JPEG
