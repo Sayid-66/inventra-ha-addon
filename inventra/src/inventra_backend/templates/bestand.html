@@ -10,7 +10,7 @@
       <article class="card product-card">
         <h2><a href="{{ ingress_url(request, 'produkt/' + product.productId) }}">{{ product.name }}</a></h2>
 
-        {% if product.imageUrl %}
+        {% if product.imageUrl and (product.imageUrl.startswith("http://") or product.imageUrl.startswith("https://")) %}
           <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
         {% endif %}
 

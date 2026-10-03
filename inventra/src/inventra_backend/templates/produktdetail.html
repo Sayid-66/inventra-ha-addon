@@ -14,7 +14,7 @@
       </div>
     {% endif %}
 
-    {% if product.imageUrl %}
+    {% if product.imageUrl and (product.imageUrl.startswith("http://") or product.imageUrl.startswith("https://")) %}
       <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
     {% endif %}
 

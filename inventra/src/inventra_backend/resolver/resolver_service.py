@@ -16,6 +16,7 @@ from .resolution_store import create_resolution
 from .scoring import FieldMergeResult, merge_text_field, merge_quantity_field
 from .single_flight import SingleFlight
 from .source_client import SourceResult
+from .name_normalizer import normalize_product_name, normalize_category, clean_source_text
 from .sources import ALL_SOURCES, build_client
 
 _single_flight = SingleFlight()
@@ -56,7 +57,9 @@ async def _fetch_all_sources(barcode: str, settings: Settings) -> dict[str, Sour
 
 def _merge_all_fields(results: dict[str, SourceResult]) -> dict[str, FieldMergeResult]:
     def text_by_source(attr: str) -> dict[str, str | None]:
-        return {s: (r.candidate.__dict__.get(attr) if r.candidate else None) for s, r in results.items()}
+        cleaner = {"name": normalize_product_name, "category": normalize_category,
+                   "brand": clean_source_text, "variant": clean_source_text}.get(attr, lambda value: value)
+        return {s: cleaner(r.candidate.__dict__.get(attr) if r.candidate else None) for s, r in results.items()}
 
     return {
         "name": merge_text_field("name", text_by_source("name")),
@@ -156,6 +159,8 @@ async def re_resolve(product_id: str, barcode: str) -> ReResolveResult | None:
     diff: dict[str, dict] = {}
     for field_name, result in merged.items():
         is_manual = bool(provenance.get(field_name, {}).get("manual"))
+        if field_name == "imageUrl" and (current.get("imageUrl") or "").startswith("/api/v1/products/"):
+            is_manual = True
         current_value = current.get(current_value_key_map[field_name])
         proposed_value = result.value
         changed = (not is_manual) and proposed_value is not None and proposed_value != current_value

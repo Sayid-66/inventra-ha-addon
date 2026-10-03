@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import httpx
 
 from ..services.unit_normalizer import normalize_quantity
+from .name_normalizer import normalize_product_name, normalize_category
 
 
 @dataclass(frozen=True)
@@ -86,11 +87,11 @@ class OpenFactsClient:
         quantity_text = (f"{amount:g} {abbreviation}" if amount is not None and abbreviation
                          else product.get("quantity"))
         candidate = SourceCandidate(
-            name=product.get("product_name_de") or product.get("product_name"),
+            name=normalize_product_name(product.get("product_name_de")) or normalize_product_name(product.get("product_name")),
             brand=_first_brand(product.get("brands")),
             quantity_text=quantity_text,
             image_url=product.get("image_url"),
-            category=(product.get("categories") or "").split(",")[0].strip() or None,
+            category=normalize_category((product.get("categories") or "").split(",")[0]),
             variant=None,
         )
         return SourceResult(source=self._source_id, status="FOUND", candidate=candidate)

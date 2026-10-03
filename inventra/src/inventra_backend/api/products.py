@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Path
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Request, HTTPException
+from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
+
 from sqlalchemy.orm import Session
+
+from ..services import image_service
 
 from ..auth.device_token import require_device
 from ..db.base import get_db
@@ -94,6 +99,7 @@ def update_product_route(
         previous_provenance = {}
     else:
         previous_provenance = json.loads(product.field_provenance) if product.field_provenance else {}
+    previous_image_url = product.image_url if product else None
     resolution = _resolve_for_provenance(db, body.resolution_id)
     quantity, unit_id, submitted_quantity = _package_size(body, db, resolution)
     present = body.model_fields_set
@@ -121,6 +127,8 @@ def update_product_route(
             db, cs, body.operation_id, product_id, version=body.version,
             field_provenance=provenance, **updates,
         )
+    if previous_image_url != result["imageUrl"] and image_service.is_uploaded_url(product_id, previous_image_url):
+        background_tasks.add_task(image_service.remove_uploaded_url, product_id, previous_image_url)
     background_tasks.add_task(bring_service.schedule_stock_change, product_id, False)
     return result
 
@@ -133,6 +141,37 @@ def delete_product_route(
 ):
     with change_set(db) as cs:
         result = soft_delete_product(db, cs, body.operation_id, product_id, body.version)
+    background_tasks.add_task(image_service.remove_images, product_id)
     # Defer the nested session until the request commits, avoiding a self-deadlock on BEGIN IMMEDIATE.
     background_tasks.add_task(bring_service.on_product_deleted_with_cleanup, product_id)
     return result
+
+
+@router.put("/{product_id}/image", response_model=ProductResponse)
+async def upload_product_image_route(
+    product_id: Annotated[str, Path(pattern=image_service.PRODUCT_ID_PATTERN)],
+    request: Request, device: Device = Depends(require_device),
+):
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdecimal() and int(content_length) > image_service.MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image exceeds 3 MB limit")
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > image_service.MAX_IMAGE_BYTES:
+            raise HTTPException(413, "Image exceeds 3 MB limit")
+        data.extend(chunk)
+    return await run_in_threadpool(
+        image_service.store_image_transaction, product_id, bytes(data),
+        request.headers.get("content-type", ""),
+    )
+
+
+@router.get("/{product_id}/image")
+def get_product_image_route(
+    product_id: Annotated[str, Path(pattern=image_service.PRODUCT_ID_PATTERN)],
+    db: Session = Depends(get_db), device: Device = Depends(require_device),
+):
+    path, media_type = image_service.find_image(db, product_id)
+    return FileResponse(path, media_type=media_type,
+                        headers={"Cache-Control": "private, max-age=31536000, immutable",
+                                 "X-Content-Type-Options": "nosniff"})
