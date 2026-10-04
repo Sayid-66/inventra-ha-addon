@@ -7,6 +7,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from .ids import new_id
+from .location_kind import is_freezer_location_name
 from ..db.models import Batch, ChangeKind, ConsumptionEvent, CorrectionEvent, Location, Store, Product, PurchaseEvent, RelocationEvent
 from ..errors import BusinessRuleViolation
 from ..idempotency.operations import run_idempotent
@@ -39,6 +40,7 @@ def _batch_to_dict(batch: Batch) -> dict:
         "locationId": batch.location_id,
         "mhd": batch.mhd,
         "eventTimestamp": batch.event_timestamp,
+        "storedAt": batch.stored_at,
         "isContentTracked": batch.is_content_tracked,
         "contentUnitLabel": batch.content_unit_label,
         "remainingQuantity": batch.remaining_quantity,
@@ -110,6 +112,7 @@ def _deplete_fifo(
             "correction_event_id": batch.correction_event_id,
             "mhd": batch.mhd,
             "event_timestamp": batch.event_timestamp,
+            "stored_at": batch.stored_at,
             "content_unit_label": batch.content_unit_label,
         }
         taken.append((snapshot, take))
@@ -238,7 +241,7 @@ def commit_purchase(
         batch_id = new_id()
         batch = Batch(
             id=batch_id, product_id=product.id, purchase_event_id=event_id, correction_event_id=None,
-            location_id=location_id, mhd=mhd, event_timestamp=timestamp,
+            location_id=location_id, mhd=mhd, event_timestamp=timestamp, stored_at=timestamp,
             is_content_tracked=is_content_tracked, content_unit_label=content_unit_label,
             remaining_quantity=content_total if is_content_tracked else quantity,
         )
@@ -339,7 +342,7 @@ def correct_stock(
             batch_id = new_id()
             batch = Batch(
                 id=batch_id, product_id=product_id, purchase_event_id=None, correction_event_id=event_id,
-                location_id=location_id, mhd=mhd_for_increase, event_timestamp=timestamp,
+                location_id=location_id, mhd=mhd_for_increase, event_timestamp=timestamp, stored_at=timestamp,
                 is_content_tracked=is_content_tracked, content_unit_label=content_unit_label,
                 remaining_quantity=new_quantity - current,
             )
@@ -382,7 +385,16 @@ def relocate(
         is_content_tracked = stock_kind == "CONTENT"
         taken = _deplete_fifo(db, cs, product_id, from_location_id, is_content_tracked, quantity)
 
+        keep_freezing_date = (
+            is_freezer_location_name(db.get(Location, from_location_id).name)
+            and is_freezer_location_name(db.get(Location, to_location_id).name)
+        )
         for snapshot, moved_amount in taken:
+            new_stored_at = (
+                snapshot["stored_at"]
+                if keep_freezing_date and snapshot["stored_at"] is not None
+                else timestamp
+            )
             existing = db.execute(
                 select(Batch).where(
                     Batch.location_id == to_location_id,
@@ -392,6 +404,8 @@ def relocate(
             ).scalar_one_or_none()
             if existing is not None:
                 existing.remaining_quantity += moved_amount
+                stored_dates = [value for value in (existing.stored_at, new_stored_at) if value is not None]
+                existing.stored_at = min(stored_dates) if stored_dates else None
                 db.flush()
                 cs.record("Batch", existing.id, ChangeKind.UPDATE, _batch_to_dict(existing))
             else:
@@ -401,7 +415,8 @@ def relocate(
                     purchase_event_id=snapshot["purchase_event_id"],
                     correction_event_id=snapshot["correction_event_id"],
                     location_id=to_location_id, mhd=snapshot["mhd"],
-                    event_timestamp=snapshot["event_timestamp"], is_content_tracked=is_content_tracked,
+                    event_timestamp=snapshot["event_timestamp"], stored_at=new_stored_at,
+                    is_content_tracked=is_content_tracked,
                     content_unit_label=snapshot["content_unit_label"], remaining_quantity=moved_amount,
                 )
                 db.add(new_batch)

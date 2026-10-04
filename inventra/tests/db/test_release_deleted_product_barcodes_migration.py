@@ -32,7 +32,7 @@ def test_0009_repairs_in_one_revision_or_allocates_none(tmp_path, repair, counte
         rows = db.execute(text("SELECT * FROM change_log WHERE revision > 7")).mappings().all()
         assert len(rows) == (2 if repair else 0)
         assert db.execute(text("SELECT current_revision FROM revision_counter WHERE id = 0")).scalar_one() == (counter + 1 if repair else counter)
-        assert db.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_instance_identity"
+        assert db.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_batch_stored_at"
         for row in rows:
             assert row['revision'] == counter + 1
             assert row['entity_type'] == 'Barcode'

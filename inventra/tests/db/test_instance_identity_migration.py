@@ -21,7 +21,7 @@ def test_identity_migration_single_row_repeatable_and_downgrade(tmp_path):
         identity, created = db.execute(text("SELECT instance_id, created_at FROM instance_meta")).one()
         assert UUID(identity).version == 4
         assert created is not None
-        assert db.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0011_instance_identity"
+        assert db.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0012_batch_stored_at"
     migrate(path, "upgrade", "head")
     spec = importlib.util.spec_from_file_location("identity_migration", ROOT / "migrations/versions/0011_instance_identity.py")
     migration = importlib.util.module_from_spec(spec)

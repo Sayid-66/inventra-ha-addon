@@ -122,3 +122,22 @@ def test_snapshot_identity_and_current_counter(api_client_with_device):
     assert future["currentRevision"] == 1
     assert future["snapshotRevision"] == 1000
     assert future["instanceId"] == empty["instanceId"]
+
+
+
+def test_addon_version_default_and_environment(api_client_with_device, monkeypatch):
+    client, device = api_client_with_device
+    monkeypatch.delenv("INVENTRA_ADDON_VERSION", raising=False)
+    response = client.get("/api/v1/snapshot", headers=_headers(device))
+    assert response.status_code == 200
+    assert response.json()["addonVersion"] == "dev"
+    monkeypatch.setenv("INVENTRA_ADDON_VERSION", "0.1.18-test")
+    response = client.get("/api/v1/snapshot", headers=_headers(device))
+    assert response.json()["addonVersion"] == "0.1.18-test"
+    created = client.post("/api/v1/locations", json={
+        "operationId": test_uuid("version-op"), "id": test_uuid("version-location"),
+        "name": "Version test",
+    }, headers=_headers(device))
+    assert created.status_code == 201
+    response = client.get("/api/v1/snapshot", headers=_headers(device))
+    assert response.json()["addonVersion"] == "0.1.18-test"

@@ -19,6 +19,7 @@ async def resolve_route(body: ResolveRequest, device: Device = Depends(require_d
         return ResolveResponse(resolutionId=None, matchedLocally=True, product=result.product, fields=None)
     return ResolveResponse(
         resolutionId=result.resolution_id, matchedLocally=False, product=None,
+        rawSources=result.raw_sources,
         fields={
             name: FieldResultResponse(
                 value=r.value, suggested=r.suggested,

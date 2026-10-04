@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from uuid import uuid4
 
@@ -8,6 +9,10 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 from ..db.models import InstanceMeta, RevisionCounter
+
+
+def get_addon_version() -> str:
+    return os.environ.get("INVENTRA_ADDON_VERSION", "dev")
 
 
 def get_instance_id(db: Session) -> str:

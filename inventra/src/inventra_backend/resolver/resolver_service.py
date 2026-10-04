@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field, replace
 
 from sqlalchemy.orm import Session
@@ -32,6 +33,7 @@ class ResolveResult:
     product: dict | None
     resolution_id: str | None
     fields: dict[str, FieldMergeResult] = field(default_factory=dict)
+    raw_sources: dict[str, dict] = field(default_factory=dict)
 
 
 async def _fetch_one_source(config, barcode: str, settings: Settings) -> SourceResult:
@@ -110,6 +112,30 @@ def _field_result_to_dict(result: FieldMergeResult) -> dict:
     }
 
 
+def _raw_sources(results: dict[str, SourceResult]) -> dict[str, dict]:
+    raw = {}
+    for source, result in results.items():
+        # Exception messages may contain URLs or request details; expose codes only.
+        error = result.error
+        if error:
+            error = error[:64] if re.fullmatch(r"[A-Za-z0-9_]+", error) else "source_error"
+        entry = {"status": result.status, "error": error or None}
+        candidate = result.candidate
+        if candidate is not None:
+            values = {
+                "name": candidate.name,
+                "brand": candidate.brand or ", ".join(candidate.brands) or None,
+                "quantityText": candidate.quantity_text,
+                "category": candidate.category,
+                "variant": candidate.variant,
+            }
+            entry.update({key: value[:200] if value is not None else None
+                          for key, value in values.items()})
+            entry["hasImage"] = bool(candidate.image_url)
+        raw[source] = entry
+    return raw
+
+
 async def resolve(barcode: str) -> ResolveResult:
     # Step 1 (spec §4.2): short session, known-barcode check + cache read, then close.
     with Session(get_engine()) as db:
@@ -146,7 +172,8 @@ async def resolve(barcode: str) -> ResolveResult:
         resolution_id = create_resolution(db, barcode, proposed_fields, settings)
         db.commit()
 
-    return ResolveResult(matched_locally=False, product=None, resolution_id=resolution_id, fields=merged)
+    return ResolveResult(matched_locally=False, product=None, resolution_id=resolution_id, fields=merged,
+                         raw_sources=_raw_sources(all_results))
 
 
 @dataclass(frozen=True)

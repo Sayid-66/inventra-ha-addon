@@ -28,6 +28,7 @@ class ResolveResponse(BaseModel):
     matched_locally: bool = Field(alias="matchedLocally")
     product: Optional[dict] = None
     fields: Optional[dict[str, FieldResultResponse]] = None
+    raw_sources: Optional[dict[str, dict]] = Field(default=None, alias="rawSources")
 
     model_config = {"populate_by_name": True}
 

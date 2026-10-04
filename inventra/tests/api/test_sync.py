@@ -90,3 +90,22 @@ def test_sync_identity_and_rewind_contract(api_client_with_device):
     assert rewind["nextRevision"] == 1000
     assert rewind["changes"] == []
     assert rewind["hasMore"] is False
+
+
+
+def test_addon_version_default_and_environment(api_client_with_device, monkeypatch):
+    client, device = api_client_with_device
+    monkeypatch.delenv("INVENTRA_ADDON_VERSION", raising=False)
+    response = client.get("/api/v1/sync?since_revision=0", headers=_headers(device))
+    assert response.status_code == 200
+    assert response.json()["addonVersion"] == "dev"
+    monkeypatch.setenv("INVENTRA_ADDON_VERSION", "0.1.18-test")
+    response = client.get("/api/v1/sync?since_revision=0", headers=_headers(device))
+    assert response.json()["addonVersion"] == "0.1.18-test"
+    created = client.post("/api/v1/locations", json={
+        "operationId": test_uuid("version-op"), "id": test_uuid("version-location"),
+        "name": "Version test",
+    }, headers=_headers(device))
+    assert created.status_code == 201
+    response = client.get("/api/v1/sync?since_revision=0", headers=_headers(device))
+    assert response.json()["addonVersion"] == "0.1.18-test"

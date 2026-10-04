@@ -6,7 +6,7 @@ from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
 from ..db.models import ChangeLog
-from .instance_service import get_current_revision, get_instance_id
+from .instance_service import get_addon_version, get_current_revision, get_instance_id
 from .sync_service import SYNC_DATA_EPOCH
 
 
@@ -49,6 +49,7 @@ def fetch_snapshot_page(
     return {
         "dataEpoch": SYNC_DATA_EPOCH,
         "instanceId": get_instance_id(db),
+        "addonVersion": get_addon_version(),
         "currentRevision": get_current_revision(db),
         "snapshotRevision": snapshot_revision,
         "entities": [

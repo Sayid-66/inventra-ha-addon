@@ -93,6 +93,7 @@ class Batch(Base):
     location_id: Mapped[str] = mapped_column(String(36), ForeignKey("locations.id"))
     mhd: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     event_timestamp: Mapped[int] = mapped_column(Integer)
+    stored_at: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_content_tracked: Mapped[bool] = mapped_column()
     content_unit_label: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     remaining_quantity: Mapped[int] = mapped_column(Integer)

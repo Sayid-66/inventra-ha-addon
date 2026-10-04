@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HEAD = "0011_instance_identity"
+HEAD = "0012_batch_stored_at"
 PARENT = "0009_release_barcodes_of_deleted_products"
 
 
