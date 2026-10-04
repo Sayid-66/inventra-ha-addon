@@ -83,22 +83,54 @@ def test_relocation_into_freezer_and_refreezing(stock):
 
 
 @pytest.mark.parametrize("initial", [1000, None])
-def test_freezer_to_freezer_preserves_known_date(stock, initial):
+def test_freezer_to_freezer_preserves_freezing_date(stock, initial):
     purchase(stock, "f")
     stock.scalar(select(Batch)).stored_at = initial
     batch = move(stock, "f", "t", 2000)
-    assert batch.stored_at == (initial if initial is not None else 2000)
+    assert batch.stored_at == initial
     assert batch.event_timestamp == 1000
     assert_logged(stock, batch, "CREATE")
 
 
+@pytest.mark.parametrize("source", ["v", "k"])
 @pytest.mark.parametrize("existing_date", [1500, 5000, None])
-def test_relocation_merge_keeps_oldest_non_null_date(stock, existing_date):
-    purchase(stock)
-    destination = move(stock, "v", "f", 2000, quantity=1)
+def test_relocation_merge_keeps_unknown_or_oldest_date(stock, source, existing_date):
+    purchase(stock, source)
+    destination = move(stock, source, "f", 2000, quantity=1)
     destination.stored_at = existing_date
-    batch = move(stock, "v", "f", 3000, quantity=2)
+    batch = move(stock, source, "f", 3000, quantity=2)
     assert batch.id == destination.id
     assert batch.remaining_quantity == 3
-    assert batch.stored_at == (min(existing_date, 3000) if existing_date is not None else 3000)
+    assert batch.stored_at == (min(existing_date, 3000) if existing_date is not None else None)
     assert_logged(stock, batch, "UPDATE")
+
+
+@pytest.mark.parametrize("source_date, existing_date, expected", [
+    (None, 1500, None), (1500, None, None), (None, None, None),
+    (1000, 1500, 1000), (5000, 1500, 1500),
+])
+def test_freezer_merge_preserves_unknown_or_oldest(stock, source_date, existing_date, expected):
+    purchase(stock, "f")
+    destination = move(stock, "f", "t", 2000, quantity=1)
+    destination.stored_at = existing_date
+    stock.scalar(select(Batch).where(Batch.location_id == "f")).stored_at = source_date
+    batch = move(stock, "f", "t", 3000, quantity=2)
+    assert batch.id == destination.id
+    assert batch.remaining_quantity == 3
+    assert batch.stored_at == expected
+    assert_logged(stock, batch, "UPDATE")
+
+
+@pytest.mark.parametrize("source, destination", [("f", "k"), ("k", "f")])
+def test_cross_freezer_boundary_replaces_unknown_date(stock, source, destination):
+    purchase(stock, source)
+    stock.scalar(select(Batch)).stored_at = None
+    assert move(stock, source, destination, 2000).stored_at == 2000
+
+
+def test_non_freezer_merge_keeps_existing_non_null_rule(stock):
+    purchase(stock, "f")
+    destination = move(stock, "f", "k", 2000, quantity=1)
+    destination.stored_at = None
+    stock.scalar(select(Batch).where(Batch.location_id == "f")).stored_at = None
+    assert move(stock, "f", "k", 3000, quantity=2).stored_at == 3000

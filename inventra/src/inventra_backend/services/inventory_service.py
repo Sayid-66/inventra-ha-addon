@@ -385,14 +385,15 @@ def relocate(
         is_content_tracked = stock_kind == "CONTENT"
         taken = _deplete_fifo(db, cs, product_id, from_location_id, is_content_tracked, quantity)
 
+        destination_is_freezer = is_freezer_location_name(db.get(Location, to_location_id).name)
         keep_freezing_date = (
             is_freezer_location_name(db.get(Location, from_location_id).name)
-            and is_freezer_location_name(db.get(Location, to_location_id).name)
+            and destination_is_freezer
         )
         for snapshot, moved_amount in taken:
             new_stored_at = (
                 snapshot["stored_at"]
-                if keep_freezing_date and snapshot["stored_at"] is not None
+                if keep_freezing_date
                 else timestamp
             )
             existing = db.execute(
@@ -404,8 +405,11 @@ def relocate(
             ).scalar_one_or_none()
             if existing is not None:
                 existing.remaining_quantity += moved_amount
-                stored_dates = [value for value in (existing.stored_at, new_stored_at) if value is not None]
-                existing.stored_at = min(stored_dates) if stored_dates else None
+                if (destination_is_freezer and existing.stored_at is None) or (keep_freezing_date and new_stored_at is None):
+                    existing.stored_at = None
+                else:
+                    stored_dates = [value for value in (existing.stored_at, new_stored_at) if value is not None]
+                    existing.stored_at = min(stored_dates) if stored_dates else None
                 db.flush()
                 cs.record("Batch", existing.id, ChangeKind.UPDATE, _batch_to_dict(existing))
             else:
