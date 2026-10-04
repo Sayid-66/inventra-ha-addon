@@ -3,14 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from urllib.parse import parse_qs
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi import APIRouter, Depends, Path, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..auth.ingress_identity import require_ingress_identity
 from ..db.base import get_db
 from ..db.models import BringWatchState, Device, Location
+from ..services import image_service
 from ..services.dashboard_service import get_dashboard_status
 from ..services.stock_query_service import get_product_detail, list_current_stock, list_stock_history
 from ..web_templates import ingress_url, templates
@@ -176,6 +177,19 @@ async def set_default_location(
         url=ingress_url(request, "geraete"),
         status_code=303,
     )
+
+
+@router.get("/produkt/{product_id}/bild")
+def produktbild(
+    product_id: str = Path(pattern=image_service.PRODUCT_ID_PATTERN),
+    db: Session = Depends(get_db),
+    _user_id: str = Depends(require_ingress_identity),
+) -> FileResponse:
+    path, media_type = image_service.find_image(db, product_id)
+    return FileResponse(path, media_type=media_type, headers={
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.get("/produkt/{product_id}", response_class=HTMLResponse)

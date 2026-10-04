@@ -4,7 +4,15 @@
 
 {% block content %}
   <article class="card product-card">
+    {% set image_src = web_image_src(request, product) if web_image_src is defined else
+      (product.imageUrl if product.imageUrl and product.imageUrl.startswith(('http://', 'https://')) else none) %}
+    {% if image_src %}
+      <img class="product-image" src="{{ image_src }}" alt="{{ product.name }}" loading="lazy">
+    {% endif %}
     <h1>{{ product.name }}</h1>
+    {% if product.packageSize %}<p class="product-size">{{ product.packageSize }}</p>{% endif %}
+    {% if product.brand %}<p class="product-brand">Marke: {{ product.brand }}</p>{% endif %}
+    {% if product.variant %}<p class="product-variant">Sorte: {{ product.variant }}</p>{% endif %}
 
     {% if bring_watch %}
       <div class="status-box">
@@ -12,10 +20,6 @@
         {% if bring_watch.lock_reason %}({{ bring_watch.lock_reason }}){% endif %}
         {% if bring_watch.last_error %}<span class="confirm-actions">{{ bring_watch.last_error }}</span>{% endif %}
       </div>
-    {% endif %}
-
-    {% if product.imageUrl and (product.imageUrl.startswith("http://") or product.imageUrl.startswith("https://")) %}
-      <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
     {% endif %}
 
     <dl class="info-list">

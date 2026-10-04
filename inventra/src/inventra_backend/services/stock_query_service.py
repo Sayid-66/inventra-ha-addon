@@ -9,6 +9,7 @@ from ..db.models import (
     Batch, ConsumptionEvent, CorrectionEvent, Location, Product, PurchaseEvent, RelocationEvent,
 )
 from .unit_normalizer import canonical_unit
+from ..resolver.product_naming import format_size
 
 
 def stock_packs(product: Product, summary: dict) -> int:
@@ -85,6 +86,10 @@ def _build_summary(product: Product, batches: list[Batch], locations_by_id: dict
         "productId": product.id,
         "name": product.name,
         "imageUrl": product.image_url,
+        "brand": product.brand,
+        "variant": product.variant,
+        "packageSize": format_size(product.quantity, product.unit.abbreviation)
+        if product.quantity is not None and product.unit is not None else None,
         "totalStk": sum(e["quantity"] for e in stk_list),
         "stkByLocation": stk_list,
         "totalContent": total_content,

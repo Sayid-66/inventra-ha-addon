@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from inventra_backend.db.models import Batch, Location, Product
 from inventra_backend.services.stock_query_service import build_summaries, build_summary_for_product
 
@@ -28,3 +28,27 @@ def test_single_summary_missing_deleted(db_session):
     db_session.flush()
     assert build_summary_for_product(db_session, "unknown") is None
     assert build_summary_for_product(db_session, "deleted") is None
+
+
+def test_summary_additive_metadata_and_missing_package_parts(db_session):
+    from inventra_backend.db.models import Unit
+    from sqlalchemy import select
+    unit = db_session.scalar(select(Unit).where(Unit.abbreviation == "l"))
+    product = Product(id="metadata", name="Milch", brand="Marke", variant="Mild",
+                      quantity=1.5, unit=unit)
+    db_session.add(product)
+    db_session.flush()
+    summary = build_summary_for_product(db_session, product.id)
+    assert summary["brand"] == "Marke"
+    assert summary["variant"] == "Mild"
+    assert summary["packageSize"] == "1,5 l"
+    assert set(summary) == {"productId", "name", "imageUrl", "totalStk", "stkByLocation",
+                            "totalContent", "contentUnitLabel", "contentByLocation",
+                            "nextMhd", "minStock", "brand", "variant", "packageSize"}
+    product.quantity = None
+    assert build_summary_for_product(db_session, product.id)["packageSize"] is None
+    product.quantity = 400
+    product.unit = None
+    product.brand = product.variant = None
+    summary = build_summary_for_product(db_session, product.id)
+    assert summary["packageSize"] is summary["brand"] is summary["variant"] is None

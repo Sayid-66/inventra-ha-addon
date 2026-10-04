@@ -25,7 +25,7 @@ def test_resolve_unknown_barcode_with_mocked_sources(api_client_with_device, mon
     body = resp.json()
     assert body["matchedLocally"] is False
     assert body["resolutionId"] is not None
-    assert body["fields"]["name"]["value"] == "Milch 1 l"
+    assert body["fields"]["name"]["value"] == "Milch"
 
 
 def test_re_resolve_requires_product_owned_barcode(api_client_with_device):

@@ -8,11 +8,16 @@
   {% if products %}
     {% for product in products %}
       <article class="card product-card">
-        <h2><a href="{{ ingress_url(request, 'produkt/' + product.productId) }}">{{ product.name }}</a></h2>
-
-        {% if product.imageUrl and (product.imageUrl.startswith("http://") or product.imageUrl.startswith("https://")) %}
-          <img class="product-image" src="{{ product.imageUrl }}" alt="{{ product.name }}">
+        {% set image_src = web_image_src(request, product) if web_image_src is defined else
+          (product.imageUrl if product.imageUrl and product.imageUrl.startswith(('http://', 'https://')) else none) %}
+        {% if image_src %}
+          <img class="product-image" src="{{ image_src }}" alt="{{ product.name }}" loading="lazy">
         {% endif %}
+        <h2><a href="{{ ingress_url(request, 'produkt/' + product.productId) }}">{{ product.name }}</a></h2>
+        {% if product.packageSize %}<p class="product-size">{{ product.packageSize }}</p>{% endif %}
+        {% if product.brand %}<p class="product-brand">Marke: {{ product.brand }}</p>{% endif %}
+        {% if product.variant %}<p class="product-variant">Sorte: {{ product.variant }}</p>{% endif %}
+
 
         <dl class="info-list">
           <dt>Gesamtbestand (STK)</dt>

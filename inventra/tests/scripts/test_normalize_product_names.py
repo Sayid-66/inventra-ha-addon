@@ -13,11 +13,11 @@ normalizer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(normalizer)
 
 NAMES = [
-    ("Gyros Geschnetzeltes Gyros", "Gut Ponholz", 400, "Gyros Geschnetzeltes 400 g"),
-    ("H\u00e4hnchengeschnetzeltes", "Aldi", 400, "H\u00e4hnchengeschnetzeltes 400 g"),
-    ("Hackfleisch", None, 500, "Hackfleisch 500 g"),
-    ("H\u00e4hnchen Geschnetzeltes", "Gut Ponholz", 400, "H\u00e4hnchen Geschnetzeltes 400 g"),
-    ("Pazifischer Wildlachs", "Ocean Sea", 250, "Pazifischer Wildlachs 250 g"),
+    ("Gyros Geschnetzeltes Gyros", "Gut Ponholz", 400, "Gyros Geschnetzeltes"),
+    ("H\u00e4hnchengeschnetzeltes", "Aldi", 400, "H\u00e4hnchengeschnetzeltes"),
+    ("Hackfleisch", None, 500, "Hackfleisch"),
+    ("H\u00e4hnchen Geschnetzeltes", "Gut Ponholz", 400, "H\u00e4hnchen Geschnetzeltes"),
+    ("Pazifischer Wildlachs", "Ocean Sea", 250, "Pazifischer Wildlachs"),
 ]
 
 
@@ -30,7 +30,7 @@ def database(tmp_path):
         db.execute(m.RevisionCounter.__table__.insert(), {"id": 0, "current_revision": 0})
         db.execute(m.Unit.__table__.insert(), {"id": "g", "name": "Gramm", "abbreviation": "g", "is_standard": True})
         for i, (name, brand, amount, _) in enumerate(NAMES):
-            db.execute(m.Product.__table__.insert(), {"id": str(i), "name": name,
+            db.execute(m.Product.__table__.insert(), {"id": str(i), "name": name + f" {amount} g",
                 "brand": brand, "quantity": amount, "unit_id": "g", "category": "keep",
                 "variant": "keep", "image_url": "https://example.org/image", "min_stock": 3,
                 "field_provenance": json.dumps({"name": {"manual": i == 0}}), "version": 4})
@@ -141,7 +141,7 @@ def test_custom_units_second_and_third_run_are_strict_noops(database):
     normalizer.normalize_database(database, confirm=True)
     after = products(database)
     for i, unit in enumerate(units):
-        assert after[f"custom-{i}"]["name"] == ("Toilettenpapier" if i == 0 else "Produkt") + f" 8 {unit}"
+        assert after[f"custom-{i}"]["name"] == ("Toilettenpapier" if i == 0 else "Produkt")
     assert after["no-size"]["name"] == "Milch 1 l"
     with sqlite3.connect(database) as db:
         revision = db.execute("SELECT current_revision FROM revision_counter").fetchone()
@@ -152,3 +152,60 @@ def test_custom_units_second_and_third_run_are_strict_noops(database):
         with sqlite3.connect(database) as db:
             assert db.execute("SELECT current_revision FROM revision_counter").fetchone() == revision
             assert db.execute("SELECT * FROM change_log ORDER BY revision").fetchall() == logs
+
+
+@pytest.mark.parametrize("name,amount,unit_id,expected,status,filled", [
+    ("Marke Fisch 400g", None, None, "Fisch", "updated (size filled)", True),
+    ("Marke Fisch 400g", 400, "g", "Fisch", "updated", False),
+    ("Marke Fisch 400g", 500, "g", "Marke Fisch 400g", "skipped: size conflict", False),
+    ("Marke Fisch 2x250g", None, None, "Marke Fisch 2x250g", "skipped: multipack", False),
+    ("Marke Milch 1 l", None, None, "Marke Milch 1 l", "skipped: unit unknown", False),
+    ("Marke Fisch 2x250g", 500, "g", "Marke Fisch 2x250g", "skipped: multipack", False),
+    ("Mehl 1 kg", 750, None, "Mehl 1 kg", "skipped: size conflict", False),
+    ("Toast 500 g", None, "g", "Toast 500 g", "skipped: size conflict", False),
+    ("Wasser 6 x 0,5 l", 3, "l", "Wasser 6 x 0,5 l", "skipped: multipack", False),
+    ("Toast 500 g", None, "Pkg.", "Toast 500 g", "skipped: size conflict", False),
+])
+def test_size_handling(database, name, amount, unit_id, expected, status, filled):
+    engine = create_engine(f"sqlite:///{database}")
+    with engine.begin() as db:
+        for unit in ([unit_id] if unit_id in ("l", "Pkg.") else []):
+            db.execute(m.Unit.__table__.insert(), {"id": unit, "name": unit,
+                "abbreviation": unit, "is_standard": unit == "l"})
+        db.execute(m.Product.__table__.insert(), {"id": "size-case", "name": name,
+            "brand": "Marke", "quantity": amount, "unit_id": unit_id, "version": 1})
+    engine.dispose()
+    original_bytes = database.read_bytes()
+    dry_report = normalizer.normalize_database(database, dry_run=True)
+    if status.startswith("skipped:"):
+        assert status in next(line for line in dry_report.splitlines() if line.startswith("size-case |"))
+    assert database.read_bytes() == original_bytes
+    before = products(database)["size-case"]
+    report = normalizer.normalize_database(database, confirm=True)
+    assert f"| {status}; manual=False" in next(line for line in report.splitlines() if line.startswith("size-case |"))
+    row = products(database)["size-case"]
+    assert row["name"] == expected
+    if status.startswith("skipped:"):
+        assert row == before
+        with sqlite3.connect(database) as db:
+            assert not any(json.loads(snapshot)["id"] == "size-case"
+                           for (snapshot,) in db.execute("SELECT snapshot FROM change_log"))
+    assert row["brand"] == "Marke"
+    assert row["quantity"] == (400 if filled else amount)
+    assert row["unit_id"] == ("g" if filled else unit_id)
+    for key in ("variant", "category", "image_url", "min_stock"):
+        assert row[key] == before[key]
+    after = products(database)
+    normalizer.normalize_database(database, confirm=True)
+    assert products(database) == after
+
+
+def test_manual_size_not_filled(database):
+    engine = create_engine(f"sqlite:///{database}")
+    with engine.begin() as db:
+        db.execute(m.Product.__table__.update().where(m.Product.id == "0").values(
+            quantity=None, unit_id=None))
+    engine.dispose()
+    before = products(database)["0"]
+    normalizer.normalize_database(database, confirm=True)
+    assert products(database)["0"] == before

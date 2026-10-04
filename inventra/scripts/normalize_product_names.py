@@ -7,6 +7,7 @@ a backup first, then uses one BEGIN IMMEDIATE transaction and normal sync logs.
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -19,8 +20,10 @@ if (source_dir / "inventra_backend").is_dir():
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from inventra_backend.db.base import configure_engine
-from inventra_backend.db.models import Product
-from inventra_backend.resolver.product_naming import compose_product_name, format_size
+from inventra_backend.db.models import Product, Unit
+from inventra_backend.resolver.product_naming import compose_product_name, extract_size_token
+from inventra_backend.resolver.quantity import parse_quantity
+from inventra_backend.services.unit_normalizer import canonical_unit
 from inventra_backend.revision.change_log import ChangeSet
 from inventra_backend.services.product_service import update_product
 
@@ -63,15 +66,39 @@ def normalize_database(database, *, dry_run=False, confirm=False, backup_dir=Non
             for product in db.scalars(select(Product).where(Product.deleted_at.is_(None)).order_by(Product.id)):
                 provenance = json.loads(product.field_provenance) if product.field_provenance else {}
                 manual = bool(provenance.get("name", {}).get("manual"))
-                size = format_size(product.quantity, product.unit.abbreviation) if product.unit else None
-                name = compose_product_name(product.name, [product.brand] if product.brand else [], size)
+                token = extract_size_token(product.name)[1]
+                parsed = parse_quantity(token)
+                updates = {}
+                size_status = None
+                if parsed:
+                    if parsed.pack_count > 1:
+                        size_status = "skipped: multipack"
+                    elif product.quantity is not None or product.unit_id is not None:
+                        stored = (parse_quantity(f"{product.quantity} {product.unit.abbreviation}")
+                                  if product.quantity is not None and product.unit else None)
+                        if (stored is None or (canonical_unit(stored.unit) or stored.unit)
+                                != (canonical_unit(parsed.unit) or parsed.unit)
+                                or not math.isclose(stored.amount * stored.pack_count,
+                                                    parsed.amount * parsed.pack_count)):
+                            size_status = "skipped: size conflict"
+                    else:
+                        unit = db.scalar(select(Unit).where(Unit.abbreviation.collate("NOCASE") == canonical_unit(parsed.unit)))
+                        if unit is None:
+                            size_status = "skipped: unit unknown"
+                        else:
+                            updates = {"quantity": parsed.amount, "unit_id": unit.id}
+                name = (product.name if size_status else
+                        compose_product_name(product.name, [product.brand] if product.brand else [], None))
                 status = ("skipped: manual" if manual and not include_manual else
+                          size_status if size_status else
                           "skipped: unusable" if name is None else
-                          "skipped: unchanged" if name == product.name else
-                          "would update" if dry_run else "updated")
+                          "skipped: unchanged" if name == product.name and not updates else
+                          "would update (size filled)" if dry_run and updates else
+                          "would update" if dry_run else
+                          "updated (size filled)" if updates else "updated")
                 before = product.name
-                if status == "updated":
-                    update_product(db, changes, str(uuid4()), product.id, product.version, name=name)
+                if status.startswith("updated"):
+                    update_product(db, changes, str(uuid4()), product.id, product.version, name=name, **updates)
                 lines.append(f"{product.id} | {before} -> {name or '(no safe name)'} | {status}; manual={manual}")
         return "\n".join(lines)
     finally:

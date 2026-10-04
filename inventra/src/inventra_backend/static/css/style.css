@@ -207,7 +207,8 @@ th {
 .product-image {
   display: block;
   width: min(100%, 18rem);
-  max-height: 16rem;
+  max-width: 96px;
+  max-height: 96px;
   margin-block: 0.75rem 1.25rem;
   border-radius: 0.4rem;
   object-fit: contain;
@@ -354,4 +355,11 @@ article[data-event-type] time {
   .confirm-actions .btn {
     flex: 1 1 auto;
   }
+}
+
+.product-size, .product-brand, .product-variant {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  margin: 0.25rem 0;
+  overflow-wrap: anywhere;
 }

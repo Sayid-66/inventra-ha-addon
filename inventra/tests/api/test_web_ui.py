@@ -1012,3 +1012,91 @@ def test_default_location_rejects_unknown_or_deleted_location(ingress_client, de
     assert response.headers["content-type"].startswith("text/html")
     with Session(get_engine()) as db:
         assert db.get(Device, "d1").default_location_id is None
+
+
+@pytest.mark.parametrize("view", ["bestand", "historie", "detail"])
+def test_web_uploaded_photo_and_product_metadata(ingress_client, view):
+    import hashlib
+    from inventra_backend.db.models import Unit
+    from sqlalchemy import select
+    from inventra_backend.services import image_service
+
+    if view == "historie":
+        _seed_depleted_stock_via_api()
+        pid = test_uuid("historie-p1")
+        path = "/historie"
+    else:
+        _seed_stock_via_api()
+        pid = test_uuid("bestand-p1")
+        path = "/bestand" if view == "bestand" else f"/produkt/{pid}"
+    photo = b"\xff\xd8\xffingress photo"
+    with Session(get_engine()) as db:
+        product = db.get(Product, pid)
+        product.brand = "A&B <x>"
+        product.variant = "Vanille"
+        product.quantity = 400
+        product.unit = db.scalar(select(Unit).where(Unit.abbreviation == "g"))
+        db.commit()
+        image_service.store_image(db, pid, photo, "image/jpeg")
+        db.commit()
+    digest = hashlib.sha256(photo).hexdigest()[:12]
+    url = f"/produkt/{pid}/bild?v={digest}"
+    html = ingress_client.get(path, headers=INGRESS_HEADERS).text
+    assert f'src="{url}"' in html
+    assert 'loading="lazy"' in html
+    assert "/api/v1/products/" not in html
+    heading = re.search(r"<h[12]>(.*?)</h[12]>", html, re.DOTALL)
+    if view != "detail":
+        heading = re.search(r"<h2>(.*?)</h2>", html, re.DOTALL)
+    assert "A&amp;B" not in heading.group(1)
+    positions = [html.index(text) for text in (
+        heading.group(0), 'class="product-size">400 g',
+        'class="product-brand">Marke: A&amp;B &lt;x&gt;',
+        'class="product-variant">Sorte: Vanille', "Gesamtbestand")]
+    assert positions == sorted(positions)
+    response = ingress_client.get(url, headers=INGRESS_HEADERS)
+    assert response.status_code == 200
+    assert response.content == photo
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "private, max-age=31536000, immutable"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    expected_auth = ingress_client.get("/bestand").status_code
+    assert expected_auth != 200
+    assert ingress_client.get(url).status_code == expected_auth
+    assert ingress_client.get(url, headers={"Authorization": "Bearer device-token"}).status_code == expected_auth
+    assert TestClient(create_app("api")).get(url, headers=INGRESS_HEADERS).status_code == 404
+    prefixed = ingress_client.get(path, headers={**INGRESS_HEADERS, "X-Ingress-Path": "/api/hassio_ingress/test"})
+    assert f'src="/api/hassio_ingress/test{url}"' in prefixed.text
+
+
+@pytest.mark.parametrize("image_url", [None, "javascript:alert(1)", "/api/v1/products/other/image?v=123456789abc"])
+def test_web_missing_image_and_metadata(ingress_client, image_url):
+    pid = test_uuid("web-missing-photo")
+    with Session(get_engine()) as db:
+        db.add(Product(id=pid, name="Ohne Foto", image_url=image_url, version=1))
+        db.commit()
+    for path in ("/historie", f"/produkt/{pid}"):
+        html = ingress_client.get(path, headers=INGRESS_HEADERS).text
+        assert "<img" not in html
+        for css_class in ("product-size", "product-brand", "product-variant"):
+            assert f'class="{css_class}"' not in html
+    assert ingress_client.get(f"/produkt/{pid}/bild", headers=INGRESS_HEADERS).status_code == 404
+    assert ingress_client.get("/produkt/invalid-id/bild", headers=INGRESS_HEADERS).status_code == 422
+
+
+def test_stock_json_metadata_is_additive(ingress_client):
+    _seed_stock_via_api()
+    client = TestClient(create_app("api"))
+    headers = {"Authorization": "Bearer bestand-test-token"}
+    response = client.get("/api/v1/stock", headers=headers)
+    assert response.status_code == 200
+    summary = response.json()[0]
+    assert set(summary) == {"productId", "name", "imageUrl", "totalStk", "stkByLocation",
+                            "totalContent", "contentUnitLabel", "contentByLocation",
+                            "nextMhd", "minStock", "brand", "variant", "packageSize"}
+    assert summary["brand"] is summary["variant"] is summary["packageSize"] is None
+    detail = client.get(f"/api/v1/products/{summary['productId']}/detail", headers=headers)
+    assert detail.status_code == 200
+    for key, value in summary.items():
+        assert detail.json()[key] == value
+    client.close()

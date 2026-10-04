@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from ..services.unit_normalizer import normalize_quantity
+from ..services.unit_normalizer import canonical_unit, normalize_quantity
 
 _VOLUME_UNITS = {"ml": 1.0, "cl": 10.0, "l": 1000.0}  # base unit: ml
 _MASS_UNITS = {"g": 1.0, "kg": 1000.0}  # base unit: g
@@ -44,6 +44,14 @@ def parse_quantity(text: str | None) -> QuantityCandidate | None:
     trimmed = text.strip()
     if not trimmed:
         return None
+
+    # Preserve pack counts for all recognized catalog units, too.
+    catalog_pack = re.fullmatch(r"(\d+)\s*[x\u00d7]\s*(\d+(?:[.,]\d+)?)\s*([^\W\d_]+\.?)", trimmed, re.I)
+    if catalog_pack and not _MULTIPACK.match(trimmed):
+        unit = canonical_unit(catalog_pack[3])
+        if unit:
+            return QuantityCandidate(float(catalog_pack[2].replace(',', '.')),
+                                     unit.lower(), int(catalog_pack[1]), trimmed)
 
     match = _MULTIPACK.match(trimmed)
     if match:

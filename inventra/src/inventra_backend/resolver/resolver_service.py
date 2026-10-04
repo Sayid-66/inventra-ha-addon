@@ -13,8 +13,7 @@ from ..services.product_service import get_product
 from ..services.unit_normalizer import quantity_diff
 from .cache import get_fresh_cache_entries, upsert_cache_entries
 from .resolution_store import create_resolution
-from .product_naming import compose_product_name, format_size
-from .quantity import parse_quantity
+from .product_naming import compose_product_name, extract_size_token
 from .plausibility import is_plausible_text
 from .scoring import Confidence, FieldMergeResult, merge_text_field, merge_quantity_field
 from .single_flight import SingleFlight
@@ -64,15 +63,18 @@ def _merge_all_fields(results: dict[str, SourceResult]) -> dict[str, FieldMergeR
                    "brand": clean_source_text, "variant": clean_source_text}.get(attr, lambda value: value)
         return {s: cleaner(r.candidate.__dict__.get(attr) if r.candidate else None) for s, r in results.items()}
 
-    quantity = merge_quantity_field(text_by_source("quantity_text"))
-    parsed = parse_quantity(quantity.value) if quantity.confidence in (Confidence.HIGH, Confidence.MEDIUM) else None
-    size = format_size(parsed.amount, parsed.unit, parsed.pack_count) if parsed else None
+    quantities = text_by_source("quantity_text")
+    for source, result in results.items():
+        if (result.candidate and not quantities[source]
+                and not result.candidate.quantity_text):
+            quantities[source] = extract_size_token(normalize_product_name(result.candidate.name) or "")[1]
+    quantity = merge_quantity_field(quantities)
     merged = {
         "name": merge_text_field("name", {
             source: compose_product_name(
                 result.candidate.name,
                 result.candidate.brands or ((result.candidate.brand,) if result.candidate.brand else ()),
-                size,
+                None,
             ) if result.candidate else None
             for source, result in results.items()
         }),
@@ -87,9 +89,9 @@ def _merge_all_fields(results: dict[str, SourceResult]) -> dict[str, FieldMergeR
     category_ok = (category.confidence in (Confidence.HIGH, Confidence.MEDIUM)
                    and category.value is not None and is_plausible_text(category.value))
     name = merged["name"]
-    composed = compose_product_name(name.value, (), size, category.value, category_ok)
+    composed = compose_product_name(name.value, (), category.value, category_ok)
     if name.value is None and name.suggested is not None:
-        merged["name"] = replace(name, suggested=compose_product_name(name.suggested, (), size))
+        merged["name"] = replace(name, suggested=compose_product_name(name.suggested, ()))
     elif composed is not None:
         merged["name"] = (FieldMergeResult(composed, None, Confidence.MEDIUM,
             category.selected_source, category.contributing_sources, category.conflicting_sources)

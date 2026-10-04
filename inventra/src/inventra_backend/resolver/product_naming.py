@@ -6,11 +6,15 @@ from .name_normalizer import normalize_product_name
 from .plausibility import is_plausible_text
 from ..services.unit_normalizer import canonical_unit
 
+MODIFIER_ONLY = {"zero", "light", "original", "classic", "bio", "mild", "extra",
+                 "plus", "max", "sensitive", "natur", "naturell", "fein", "frisch",
+                 "neu", "new"}
+
 # Deliberately small German slogan list; matching requires a whole opener word.
 SLOGAN_OPENERS = ("frisch vom", "frisch aus", "aus der", "aus dem", "aus",
                   "vom", "zum", "f\u00fcr", "mit", "lecker", "unser", "neu")
 SIZE_PATTERN = re.compile(
-    r"(?<!\w)(?:\d+\s*[x\u00d7]\s*)?\d+(?:[.,]\d+)?\s*(?:kilogramm|milliliter|liter|litre|gramm|kg|ml|cl|g|l|stk\.?)(?!\w)",
+    r"(?<![\w.,-])(?:(?P<pack>\d+)\s*[x\u00d7]\s*)?(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<unit>[^\W\d_]+\.?)(?!\w)",
     re.IGNORECASE,
 )
 
@@ -32,18 +36,38 @@ def split_brands(brands_raw):
 
 def strip_brands(name, brands):
     for brand in sorted((b.strip() for b in brands if b and b.strip()), key=len, reverse=True):
-        phrase = r"\s+".join(re.escape(word) for word in brand.split())
+        parts = re.split(r"([\s.-]+)", brand)
+        phrase = "".join(
+            (r"\.?[ -]?" if "." in part else r"[ -]?")
+            if index % 2 else re.escape(part)
+            for index, part in enumerate(parts)
+        )
         name = re.sub(r"(?<![\w-])" + phrase + r"(?![\w-])", " ", name, flags=re.IGNORECASE)
     return _tidy(name)
 
 
+def extract_size_token(name: str) -> tuple[str, str | None]:
+    matches = []
+    for match in SIZE_PATTERN.finditer(name):
+        raw_unit = match['unit'].rstrip('.')
+        unit = canonical_unit(raw_unit) or ('cl' if raw_unit.casefold() == 'cl' else None)
+        if unit is None or raw_unit.casefold() == 'x':
+            continue
+        amount = float(match['amount'].replace(',', '.'))
+        pack = int(match['pack'] or 1)
+        matches.append((match, (amount, unit, pack)))
+    if not matches or len({key for _, key in matches}) != 1:
+        return name, None
+    amount, unit, pack = matches[0][1]
+    cleaned = name
+    for match, _ in reversed(matches):
+        cleaned = cleaned[:match.start()] + ' ' + cleaned[match.end():]
+    size = format_size(amount, unit, pack)
+    return _tidy(cleaned), size[:-1] if unit == 'Stk.' else size
+
+
 def strip_size_tokens(name, size_text=None):
-    if size_text:
-        # Match the exact appended token, including arbitrary catalog units.
-        phrase = r"\s*".join(re.escape(part) for part in size_text.split())
-        name = re.sub(r"(?<![\w-])" + phrase + r"(?![\w-])", " ", name,
-                      flags=re.IGNORECASE)
-    return _tidy(SIZE_PATTERN.sub(" ", name))
+    return extract_size_token(name)[0]
 
 
 def dedupe_words(name):
@@ -69,7 +93,12 @@ def _has_price_or_currency(name):
 
 def is_unusable_name(name):
     name = _tidy(name or "")
-    if not name or len(name.split()) > 7:
+    if not name or len(name.split()) > 7 or all(
+        word.casefold() in MODIFIER_ONLY for word in name.split()
+    ):
+        return True
+    alphabetic = sum(c.isalpha() for c in name)
+    if alphabetic < 3 or alphabetic * 2 < sum(not c.isspace() for c in name):
         return True
     if _has_price_or_currency(name):
         return True
@@ -87,21 +116,16 @@ def format_size(amount, unit, pack_count=1):
     return f"{number(pack_count)} x {text}" if pack_count != 1 else text
 
 
-def compose_product_name(source_name, brands, size_text, category=None, category_ok=False):
+def compose_product_name(source_name, brands, category=None, category_ok=False):
     normalized = normalize_product_name(source_name) or ""
     core = strip_brands(normalized, brands)
-    core = strip_size_tokens(core, size_text) if size_text else core
-    source_core = strip_size_tokens(normalized, size_text) if size_text else normalized
-    if not core or (core != source_core and len(core.split()) == 1
-                    and len(core) <= 4 and core.isalpha()):
-        core = source_core
-    core = dedupe_words(core)
+    core = strip_size_tokens(core)
+    core = normalize_product_name(dedupe_words(core)) or ""
     if _has_price_or_currency(normalized) or is_unusable_name(core):
         # Category is an explicit fallback only, never a language/overlap heuristic.
         core = strip_brands(normalize_product_name(category) or "", brands)
-        if size_text:
-            core = strip_size_tokens(core, size_text)
+        core = normalize_product_name(dedupe_words(strip_size_tokens(core))) or ""
         if (not category_ok or len(core.split()) > 3 or is_unusable_name(core)
                 or not is_plausible_text(core)):
             return None
-    return f"{core} {size_text}" if size_text else core
+    return core

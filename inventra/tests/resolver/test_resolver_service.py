@@ -80,7 +80,7 @@ async def test_unknown_barcode_fans_out_to_all_four_sources_and_merges(monkeypat
     result = await resolver_service.resolve("9999999999999")
     assert result.matched_locally is False
     assert result.resolution_id is not None
-    assert result.fields["name"].value == "Produkt X 500 ml"
+    assert result.fields["name"].value == "Produkt X"
     assert result.fields["name"].confidence.value == "high"  # off+opf agree
 
 
@@ -224,18 +224,58 @@ async def test_re_resolve_quantity_display_and_comparison(monkeypatch, manual, p
 
 
 
-def test_naming_preserves_size_without_plausible_quantity():
+def test_naming_derives_size_without_explicit_quantity():
     from inventra_backend.resolver.resolver_service import _merge_all_fields
     from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
-    for quantity in (None, "unknown"):
+    for quantity in (None, ""):
         fields = _merge_all_fields({"off": SourceResult("off", "FOUND",
             SourceCandidate("Milch 1 l", None, quantity, None, None, None))})
-        assert fields["name"].value == "Milch 1 l"
+        assert fields["name"].value == "Milch"
+        assert fields["quantity"].value == "1 l"
 
 
-def test_naming_multipack_uses_canonical_count_unit():
+def test_naming_multipack_stays_in_quantity():
     from inventra_backend.resolver.resolver_service import _merge_all_fields
     from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
     fields = _merge_all_fields({"off": SourceResult("off", "FOUND",
         SourceCandidate("Produkt", None, "6 x 2 stk", None, None, None))})
-    assert fields["name"].value == "Produkt 6 x 2 Stk."
+    assert fields["name"].value == "Produkt"
+    assert fields["quantity"].value == "6 x 2 stk"
+
+
+@pytest.mark.parametrize("quantity", [None, ""])
+def test_name_size_quantity_fallback(quantity):
+    from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
+    result = resolver_service._merge_all_fields({
+        "off": SourceResult("off", "FOUND", SourceCandidate("Marke Fisch 400g", "Marke", quantity, None, None, None))})
+    assert result["name"].value == "Fisch"
+    assert result["quantity"].value == "400 g"
+    assert result["quantity"].selected_source == "off"
+    assert result["variant"].value is None
+
+
+def test_real_quantity_precedes_name_size_and_fallback_agrees():
+    from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
+    result = resolver_service._merge_all_fields({
+        "off": SourceResult("off", "FOUND", SourceCandidate("Fisch 400g", None, "500 g", None, None, None)),
+        "opf": SourceResult("opf", "FOUND", SourceCandidate("Fisch 500g", None, None, None, None, None))})
+    assert result["name"].value == "Fisch"
+    assert result["quantity"].value == "500 g"
+    assert result["quantity"].confidence.value == "high"
+    assert result["quantity"].contributing_sources == ["off", "opf"]
+
+
+@pytest.mark.parametrize("name", ["Fisch 400 g", "Fisch"])
+@pytest.mark.parametrize("raw", ["400 Dose", "unknown"])
+def test_unparseable_raw_quantity_reaches_merge_unchanged(monkeypatch, name, raw):
+    from inventra_backend.resolver.source_client import SourceCandidate, SourceResult
+    original = resolver_service.merge_quantity_field
+    seen = []
+    def capture(quantities):
+        seen.append(dict(quantities))
+        return original(quantities)
+    monkeypatch.setattr(resolver_service, "merge_quantity_field", capture)
+    fields = resolver_service._merge_all_fields({
+        "off": SourceResult("off", "FOUND", SourceCandidate(name, None, raw, None, None, None))})
+    assert seen == [{"off": raw}]
+    assert fields["quantity"] == original({"off": raw})

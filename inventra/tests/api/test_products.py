@@ -159,14 +159,14 @@ def test_create_product_with_resolution_id_credits_resolver_provenance(api_clien
     resp = client.post(
         "/api/v1/products",
         json={
-            "operationId": test_uuid("op1"), "id": product_id, "name": "Milch 1 l",
+            "operationId": test_uuid("op1"), "id": product_id, "name": "Milch",
             "resolutionId": resolution_id,
         },
         headers={"Authorization": f"Bearer {device.token}"},
     )
     assert resp.status_code == 201
     body = resp.json()
-    assert body["name"] == "Milch 1 l"
+    assert body["name"] == "Milch"
     assert body["fieldProvenance"]["name"]["manual"] is False
     assert body["fieldProvenance"]["name"]["selectedSource"] == "off"
 
@@ -201,7 +201,7 @@ def resolved_product(api_client_with_device, monkeypatch):
     resolution_id = resolved.json()["resolutionId"]
     created = client.post("/api/v1/products", headers=headers, json={
         "operationId": test_uuid("partial-create"), "id": test_uuid("partial-product"),
-        "name": "Milch 1 l", "brand": "Marke", "quantityText": "1 l",
+        "name": "Milch", "brand": "Marke", "quantityText": "1 l",
         "imageUrl": "https://example.com/milk.jpg", "category": "Dairy", "variant": "Whole",
         "minStock": 1, "contentUnitLabel": "Glass", "resolutionId": resolution_id,
     })
